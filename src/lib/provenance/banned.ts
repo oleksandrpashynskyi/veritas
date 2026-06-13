@@ -6,14 +6,21 @@
  * is rejected at the validation layer — not asked-against in a prompt.
  *
  * Entries are lowercase. Multi-word entries match across either spaces or hyphens
- * ("game changer" also catches "game-changer"). Matching is whole-word: "leverage"
- * does NOT trip on "leverages" — inflected forms are listed explicitly rather than
- * substring-matched, to avoid false positives on legitimate words.
+ * ("game changer" also catches "game-changer"). Matching is whole-word — a banned
+ * entry never trips inside a longer word ("wizard" does not match "wizardry").
+ * Inflections are listed explicitly rather than stemmed; the common action-verb
+ * forms (leverage/leveraging/leverages, utilize/utilizing/utilizes,
+ * spearhead/spearheading/spearheads) are all included so obvious variants of a
+ * banned root don't slip through.
  */
 export const BANNED_WORDS: readonly string[] = [
   "spearheaded",
+  "spearheading",
+  "spearheads",
   "spearhead",
   "leveraged",
+  "leveraging",
+  "leverages",
   "leverage",
   "synergize",
   "synergy",
@@ -41,6 +48,8 @@ export const BANNED_WORDS: readonly string[] = [
   "win win",
   "paradigm shift",
   "utilize",
+  "utilizing",
+  "utilizes",
   "utilized",
   "impactful",
 ] as const;

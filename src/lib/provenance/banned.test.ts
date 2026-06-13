@@ -19,10 +19,18 @@ describe("findBannedWords", () => {
     ]);
   });
 
-  it("respects word boundaries (no substring false positives)", () => {
-    // "leverages" must NOT trip the "leverage" entry — inflections are listed
-    // explicitly, never substring-matched.
-    expect(findBannedWords("The system leverages caching")).toEqual([]);
+  it("matches a banned entry only as a whole word, not inside a longer word", () => {
+    // "wizard" is banned but must not trip inside "wizardry".
+    expect(findBannedWords("Their wizardry impressed the team")).toEqual([]);
+  });
+
+  it("catches common action-verb inflections of banned roots", () => {
+    // The list includes leveraging/leverages, utilizing/utilizes,
+    // spearheading/spearheads — not just the base/past forms.
+    expect(findBannedWords("Leveraging and utilizing the pipeline")).toEqual([
+      "leveraging",
+      "utilizing",
+    ]);
   });
 
   it("deduplicates and preserves list order across multiple hits", () => {
