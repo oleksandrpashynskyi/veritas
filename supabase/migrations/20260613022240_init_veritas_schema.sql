@@ -189,3 +189,25 @@ create trigger fact_protect_citations
 -- Drafts may legitimately cite not-yet-verified facts while authoring; the
 -- provenance validation layer (src/lib/provenance/) enforces verification at
 -- approval time (M5).
+
+-- ── row level security — deny-by-default for the public API roles ────
+-- Every table holds personal career data (facts, job text, generated docs and
+-- their evidence). Supabase exposes the `anon` and `authenticated` roles over
+-- its public REST/Realtime API; without RLS, anyone with the (publishable) anon
+-- key could read or write all of it. So we enable RLS and add NO policies: with
+-- RLS on and zero policies, every row is denied to those roles — deny-by-default.
+--
+-- The app reaches the database only through the server-side service-role client
+-- (src/lib/db/client.ts). The Supabase `service_role` carries the BYPASSRLS
+-- attribute, so server-side access is unaffected. The provenance triggers and
+-- CHECK constraints above also continue to fire — RLS filters which rows a role
+-- may touch; it does not disable triggers or constraints.
+--
+-- When real multi-user auth arrives, add explicit per-user policies then; do not
+-- loosen this default to get the browser talking to the DB directly.
+alter table fact        enable row level security;
+alter table job         enable row level security;
+alter table requirement enable row level security;
+alter table coverage    enable row level security;
+alter table document    enable row level security;
+alter table doc_line    enable row level security;
