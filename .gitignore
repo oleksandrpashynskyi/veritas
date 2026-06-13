@@ -43,3 +43,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# veritas-security-proof — transient build probe (written then removed by the skill;
+# ignored so a crashed run can never accidentally commit it)
+/src/app/security-probe/
