@@ -1,6 +1,6 @@
 ---
 name: veritas-security-proof
-description: Prove, by execution, the two M1 security properties — (A) RLS deny-by-default blocks the public anon role from reading or writing any row of all six tables, proven via the anon KEY over PostgREST against a sentinel the service role can see; and (B) the server-only guard makes `next build` fail when src/lib/db/client.ts is imported from a Client Component. Run before any CRUD touches real career data, and on any change to src/lib/db, the RLS in supabase/migrations, or this script.
+description: Prove, by execution, the two M1 security properties — (A) RLS deny-by-default blocks the public anon role from READING any row (an unfiltered select returns 0 while the service role sees the rows) and from WRITING (insert/update/delete, each judged by service-role ground truth) on all six tables; and (B) the server-only guard makes `next build` fail ATTRIBUTABLY when src/lib/db/client.ts is imported from a Client Component (green without the probe, fails only with it). Run before any CRUD touches real career data, and on any change to src/lib/db, the RLS in supabase/migrations, or this script.
 disable-model-invocation: true
 argument-hint: "(no arguments; reads .env.local, runs next build)"
 ---
@@ -11,33 +11,40 @@ Prove — by execution, never by inspection — the two things M1 asserted but o
 confirmed manually, **before** M2 puts real career data in the database:
 
 - **A. RLS deny-by-default.** Holding the publishable **anon key** and talking to
-  PostgREST exactly as a browser would, the `anon` role can read **zero** rows and
-  write **zero** rows on every one of the six tables (`fact, job, requirement,
-  coverage, document, doc_line`). Proven against a sentinel row the **service-role**
-  client provably *can* read — so "anon got nothing" means "RLS hid it", not "the
-  table was empty" or "I hit the wrong database".
+  PostgREST exactly as a browser would, on every one of the six tables (`fact, job,
+  requirement, coverage, document, doc_line`) the `anon` role can:
+  - **read no row** — an **unfiltered** anon select returns **0 rows** while the
+    **service role** confirms ≥2 rows exist, so "anon got nothing" means "RLS hid
+    every row", not "the table was empty" or "I hit the wrong database"; and
+  - **write no row** — anon **INSERT**, **UPDATE**, and **DELETE** are each rejected,
+    each judged by **service-role ground truth** (was a row actually created /
+    changed / removed?), never by trusting anon's own — maskable — response.
 - **B. The `server-only` build guard.** A Client Component importing the DB client
   (`src/lib/db/client.ts`, which carries the service-role key) makes `next build`
-  **fail** — proven by actually building, so the key can never reach the browser
-  bundle.
+  **fail attributably** — the app builds green *without* the probe and fails *only
+  with* it, the error naming `security-probe/page.tsx → src/lib/db/client.ts`. Proven
+  by actually building, so the key can never reach the browser bundle.
 
 ## The one hard rule
 The run MUST exit non-zero with **"COULD NOT VERIFY"** if it cannot prove a property —
-a transport/connection failure, a 404, a service-role positive control that can't see
-its own sentinel, an ambiguous (non-RLS) write rejection, a build that can't run or
-fails for an unrelated reason, or fewer than the **13** registered checks executing.
-An empty or partial result is a FAILURE, never a pass. Report success only when all 13
-checks ran and passed. The bundled script enforces this; do not work around it.
+a transport/connection failure, a 404, a service-role check that can't confirm the
+seeded rows, an ambiguous (non-`42501`) write rejection, a build that can't run / a
+non-green baseline / a failure not attributable to our probe, or fewer than the **25**
+registered checks executing. An empty or partial result is a FAILURE, never a pass.
+Report success only when all 25 checks ran and passed. The bundled script enforces
+this; do not work around it.
 
 ## What it checks
-| Property | Per table (×6) | Pass condition |
+| Property | Probe | Pass condition |
 |---|---|---|
-| A — read denial | anon SELECT of the sentinel row | HTTP 200 `[]` (RLS-filtered) **or** a 4xx permission error |
-| A — write denial | anon INSERT of a well-formed row | rejected with SQLSTATE `42501` (RLS / no grant) |
-| B — build guard | one `next build` with a probe Client Component | build exits non-zero **and** output names `server-only` + "cannot be imported from a Client Component module" |
+| A — read denial (×6) | anon UNFILTERED select; svc confirms ≥2 rows | anon returns 0 rows (or a `42501` grant error) |
+| A — insert denial (×6) | anon INSERT of a well-formed row | `42501` (RLS); doc_line: `23503` provenance trigger, no row created |
+| A — update denial (×6) | anon UPDATE of a seeded row | svc ground truth: the column is **unchanged** |
+| A — delete denial (×6) | anon DELETE of a seeded row | svc ground truth: the row is **still present** |
+| B — build guard (×1) | baseline `next build`, then again with a probe Client Component | baseline **green**; probe build **fails** naming `security-probe` → `client.ts` + the server-only boundary |
 
-A returned sentinel row = LEAK = regression (exit 1). A successful anon INSERT = LEAK =
-regression (exit 1). A green build = the guard is broken = regression (exit 1).
+Any anon-visible row, a successful anon INSERT, a column the anon UPDATE changed, a row
+the anon DELETE removed, or a green probe build = LEAK / broken guard = regression (exit 1).
 
 ## No secrets here
 The bundled `verify-security.mjs` reads `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and
@@ -55,25 +62,38 @@ From the repo root:
 node .claude/skills/veritas-security-proof/verify-security.mjs "$PWD"
 ```
 
-It seeds a sentinel graph via the service role, runs the 12 anon checks, then writes a
-temporary `src/app/security-probe/page.tsx`, runs `next build`, and removes it.
-Exit `0` = proved, `1` = regression (a leak or a broken guard — STOP, do not merge),
-`2` = could not verify (fix the cause and re-run; never treat as a pass).
+It seeds 2 probe rows per table via the service role, runs the 24 anon checks
+(read/insert/update/delete × 6), then builds once **without** a probe (must be green)
+and once **with** a temporary `src/app/security-probe/page.tsx` (must fail attributably),
+removing it after. Exit `0` = proved, `1` = regression (a leak or a broken guard — STOP,
+do not merge), `2` = could not verify (fix the cause and re-run; never treat as a pass).
 
 ## How it refuses to lie
-- Anon reads are filtered to a sentinel the service role just proved exists, so an
-  empty result is provably "hidden", not "absent".
+- **Reads are unfiltered**, judged against a service-role count: anon must return 0
+  rows while svc sees ≥2 — so a policy hiding only one probed row, or an empty table,
+  cannot pass. A `42501` grant error also counts as denial; **any other error —
+  including a 401/403 auth failure — is COULD NOT VERIFY**, never a denial. The only
+  read PASS is an authoritative `42501` or a true `200`-empty.
+- **Writes are judged by service-role ground truth**, not anon's response: anon's
+  `.update()/.delete()` RETURNING can be masked by RLS (anon may lack SELECT), so the
+  proof re-reads each row AS the service role and PASSes only if it is genuinely
+  unchanged / still present. A successful INSERT, a changed column, or a missing row is
+  a LEAK.
+- **doc_line INSERT** is refused before RLS by the fact-existence trigger (run AS anon,
+  which can't see the cited fact): that `23503` is reported as a *provenance* denial (no
+  row created), **not** as proof of doc_line's RLS write-denial — which is instead
+  proven by its UPDATE and DELETE checks.
 - `status === 0` (a transport throw) and any `404` (missing table or PostgREST's
   404→`[]` rewrite) are COULD NOT VERIFY, never a pass.
-- Anon write probes are well-formed (child rows cite the sentinel fact) so RLS is the
-  only thing left to reject them; a `23xxx` CHECK/FK/trigger rejection is treated as
-  inconclusive, not as proof of RLS.
-- Part B wipes `.next` before and after (Turbopack — the default builder in Next 16 —
-  caches aggressively) and only passes on a build failure it can attribute to the
-  `server-only` boundary. The probe imports **only** `getDb`, never `server-only`
-  directly, so the build fails solely because `client.ts` carries the guard.
+- **Part B** wipes `.next` before each build (Turbopack — the Next 16 default — caches
+  aggressively), requires the **baseline (no probe) to build green**, and PASSes only
+  on a probe-build failure whose output names our probe page AND `client.ts` AND the
+  server-only boundary — so an unrelated server-only failure can't satisfy it. The probe
+  imports **only** `getDb`, never `server-only` directly, so the build fails solely
+  because `client.ts` carries the guard (remove the guard → the build goes green → this
+  check FAILs).
 - It leaves the database and working tree exactly as it found them: a marker-prefixed
-  sweep removes the sentinel graph (and any leaked probe rows) on the way out, and on a
+  sweep removes the probe rows (and any leaked rows) on the way out, and on a
   prior-crash recovery on the way in; the probe dir is removed in `finally` and on
   SIGINT/SIGTERM, and is gitignored as a backstop.
 
@@ -89,7 +109,9 @@ deferral is recorded here and in PROMPTS.md item ③ so it resurfaces at the rig
 
 ## Do not
 - Treat a connection/transport/404 failure, or a `2` exit, as anything but "not proven".
-- Weaken a write probe so it trips a CHECK instead of RLS — that proves nothing about RLS.
-- Match a bundler-specific build-error string; match the boundary phrase + `server-only`.
+- Treat a non-`42501` write rejection (a CHECK/FK/`23xxx`, or an auth error) as proof of
+  RLS denial — it is not; only `42501` (or doc_line's documented `23503`) counts.
+- Pass the build guard on the `server-only` string alone — require a green baseline and a
+  failure that names our probe page and `client.ts`.
 - Add a permissive anon policy to "make it pass" — the whole point is that none exists.
 - Skip this because "it passed before" — the change in front of you is unverified.

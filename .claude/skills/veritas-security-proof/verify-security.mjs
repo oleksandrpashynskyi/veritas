@@ -3,17 +3,20 @@
 //
 //   A) RLS deny-by-default: the public `anon` role (the publishable anon KEY, over
 //      PostgREST — the real browser-facing surface) can read NO row and write NO row
-//      on any of the six tables. Proven against a sentinel row the service-role
-//      client provably CAN see, so "anon saw nothing" means "RLS hid it", not "empty
-//      table / wrong DB".
+//      (no INSERT, UPDATE, or DELETE) on any of the six tables. Read denial is proven
+//      by an UNFILTERED anon select returning 0 while the service role sees the rows.
+//      Write denial is proven by SERVICE-ROLE GROUND TRUTH (did the row actually get
+//      created / changed / removed?), never by trusting anon's own maskable response.
 //   B) The `server-only` guard in src/lib/db/client.ts holds at BUILD time: a Client
-//      Component that imports the DB client makes `next build` fail, attributably.
+//      Component importing the DB client makes `next build` fail, and the failure is
+//      ATTRIBUTABLE — the app builds green without the probe, and fails only with the
+//      probe, with the error naming security-probe/page.tsx -> src/lib/db/client.ts.
 //
-// Prime directive (same as verify.mjs): it must FAIL HONESTLY. A false pass is worse
-// than no test. Exit codes:
+// Prime directive (same as verify.mjs): it must FAIL HONESTLY. A path to a false PASS
+// is the worst defect a security proof can have. Exit codes:
 //   0  every registered check ran AND passed.
-//   1  a real regression: anon read/wrote a row, OR the build did NOT fail on the
-//      client-boundary violation.
+//   1  a real regression: anon read/created/changed/removed a row, OR the build did
+//      NOT fail attributably on the client-boundary violation.
 //   2  COULD NOT VERIFY: any precondition/transport/attribution failure. No proof
 //      produced; this is NOT a pass.
 //
@@ -65,8 +68,13 @@ export default function SecurityProbe() {
 }
 `;
 
-const SIG_PKG = "server-only";
+// Attribution tokens. A PASS requires the server-only boundary error AND that the
+// trace names OUR probe page importing the db client — so an UNRELATED server-only
+// failure elsewhere cannot satisfy it.
 const SIG_BOUNDARY = "cannot be imported from a Client Component module";
+const SIG_PKG = "server-only";
+const SIG_PROBE = "security-probe";
+const SIG_CLIENT = /client\.ts|lib[\/\\]db/;
 
 // The six tables, in FK dependency order (parents before children) for seeding.
 const TABLE_NAMES = ["fact", "job", "requirement", "coverage", "document", "doc_line"];
@@ -107,10 +115,11 @@ function projectRef(url) {
 }
 
 // ── result tracking ───────────────────────────────────────────────────────────────
-const checks = []; // registered security assertions: 12 anon + 1 build = 13
-const EXPECTED = 13;
-function record(part, name, verdict, detail) {
-  checks.push({ part, name, verdict, detail });
+// 6 read + 6 insert + 6 update + 6 delete + 1 build = 25 registered security checks.
+const checks = [];
+const EXPECTED = 25;
+function record(name, verdict, detail) {
+  checks.push({ name, verdict, detail });
 }
 function line(c) {
   const tag = c.verdict === "PASS" ? "PASS" : c.verdict === "FAIL" ? "FAIL" : "CNV ";
@@ -122,50 +131,39 @@ function bail(msg) {
   fatal = msg;
 }
 
-// ── classifiers (shapes verified against @supabase/postgrest-js) ───────────────────
-// A denied read is either an HTTP 200 with an empty body (RLS filtered the row that
-// provably exists) OR a 4xx PostgREST error (no table GRANT). A leak is the sentinel
-// coming back. status 0 = transport throw = could-not-verify. 404 = missing/[]-trap.
+const short = (e) => (e?.message || "").split("\n")[0];
+
+// ── READ classifier (unfiltered anon select; table is non-empty per svc) ───────────
+// Denied = HTTP 200 with an empty body (RLS filtered every row) OR a 42501 grant
+// error. A returned row = leak. The authoritative denial signal is the 42501 SQLSTATE
+// or a 200-empty; ANY other error — including a 401/403 auth failure — is COULD NOT
+// VERIFY (an auth/gateway failure must never be read as a real RLS denial).
 function classifyRead({ data, error, status }) {
-  if (status === 0) return ["CNV", `transport failure (status 0): ${error?.message || "fetch failed"}`];
+  if (status === 0) return ["CNV", `transport failure (status 0): ${short(error) || "fetch failed"}`];
   if (status === 404) return ["CNV", `HTTP 404 — table/route missing or []-rewrite trap; not proof`];
-  if (!error && Array.isArray(data) && data.length === 0)
-    return ["PASS", `anon read returned 0 rows of a row that provably exists`];
-  if (!error && Array.isArray(data) && data.length > 0)
-    return ["FAIL", `LEAK — anon read returned ${data.length} sentinel row(s)`];
-  const code = error?.code || "";
-  const msg = (error?.message || "").split("\n")[0];
-  if (error && (code === "42501" || /row-level security|permission denied/i.test(msg)))
-    return ["PASS", `anon read denied (${code || status}: ${msg})`];
-  // A 401/403 that is NOT a 42501 is an auth failure (invalid / expired / foreign-project
-  // key) — it would FALSELY look like "denied". That proves nothing about RLS → CNV.
-  if (error && (status === 401 || status === 403))
-    return ["CNV", `anon key not authenticating as the anon role (${code || status}: ${msg}) — cannot prove RLS`];
-  return ["CNV", `unclassified read (status=${status}, err=${code || "none"})`];
+  if (error) {
+    if (error.code === "42501") return ["PASS", `anon read denied (42501: ${short(error)})`];
+    return ["CNV", `non-RLS error on anon read (${error.code || status}: ${short(error)}) — auth/gateway/other, not proof`];
+  }
+  if (Array.isArray(data) && data.length === 0) return ["PASS", `anon UNFILTERED read returned 0 of the rows that provably exist`];
+  if (Array.isArray(data) && data.length > 0) return ["FAIL", `LEAK — anon read returned ${data.length} row(s)`];
+  return ["CNV", `unclassified read (status=${status})`];
 }
 
-// A denied write is a PostgREST error whose SQLSTATE is 42501 (RLS WITH CHECK, or a
-// missing INSERT grant — both deny). A success is a leak. A 23xxx (CHECK/FK/trigger)
-// rejection is ambiguous — it does NOT prove RLS blocked the row — so could-not-verify.
-function classifyWrite({ error, status }, expect) {
-  if (status === 0) return ["CNV", `transport failure (status 0): ${error?.message || "fetch failed"}`];
-  if (!error) return ["FAIL", `LEAK — anon INSERT succeeded`];
-  const code = error.code || "";
-  const msg = (error.message || "").split("\n")[0];
-  if (code === "42501" || /row-level security|permission denied/i.test(msg))
-    return ["PASS", `anon write denied by RLS (${code}: ${msg})`];
-  // doc_line carries a BEFORE-INSERT provenance trigger that runs AS the anon role.
-  // Since anon cannot see the sentinel fact (RLS on fact), the trigger rejects the
-  // row with 23503 BEFORE RLS WITH CHECK is reached. A 23503 citing a fact that
-  // provably exists can ONLY happen when fact-RLS is denying anon (if it were open the
-  // probe would leak or hit 42501) — so it is a genuine denial; no row was written.
-  if (expect === "provenance" && code === "23503")
-    return ["PASS", `anon write rejected — it cited an existing fact it cannot see (RLS on fact); the provenance trigger refused the row, none written (${code})`];
-  // Auth failure (invalid/foreign key) never reaches Postgres role-mapping, so it can
-  // never be a 42501 — do not let it masquerade as an RLS denial.
-  if (status === 401 || status === 403)
-    return ["CNV", `anon key not authenticating as the anon role (${code || status}: ${msg}) — cannot prove RLS`];
-  return ["CNV", `anon write rejected by a non-RLS error (${code}: ${msg}) — ambiguous, not proof`];
+// ── INSERT classifier ──────────────────────────────────────────────────────────────
+// PASS = the row was NOT created. The authoritative denial is the 42501 SQLSTATE (RLS
+// WITH CHECK, or a missing INSERT grant). A success = leak. For doc_line ONLY, the
+// fact-existence trigger (run AS anon, which cannot see the cited fact) refuses the
+// insert with 23503 BEFORE RLS WITH CHECK — a genuine "no row created" denial, but NOT
+// a proof of doc_line's own RLS write-denial (that is proven by its UPDATE/DELETE
+// checks). Any other error — incl. 401/403 — is COULD NOT VERIFY, never PASS.
+function classifyInsert({ error, status }, expect) {
+  if (status === 0) return ["CNV", `transport failure (status 0): ${short(error) || "fetch failed"}`];
+  if (!error) return ["FAIL", `LEAK — anon INSERT succeeded (a row was created)`];
+  if (error.code === "42501") return ["PASS", `anon INSERT denied by RLS (42501: ${short(error)})`];
+  if (expect === "provenance" && error.code === "23503")
+    return ["PASS", `anon INSERT refused by the provenance trigger — it cited a fact it cannot read (RLS on fact); no row created (23503). doc_line's own RLS write-denial is shown by its update/delete checks`];
+  return ["CNV", `non-RLS error on anon INSERT (${error.code || status}: ${short(error)}) — auth/constraint/other, not proof of RLS denial`];
 }
 
 // ── filesystem cleanup (sync, safe to call from signal handlers) ───────────────────
@@ -177,11 +175,11 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => { cleanupProbeSync(); process.exit(2); });
 }
 
-// ── DB seed / per-table probes / sweep cleanup ─────────────────────────────────────
-const seed = {};
+// ── DB seed / sweep cleanup ────────────────────────────────────────────────────────
+const ids = {};
 
 async function sweep(svc) {
-  // Delete a marked job (cascades requirement → coverage and document → doc_line),
+  // Delete marked jobs (cascades requirement → coverage and document → doc_line),
   // THEN the now-uncited marked facts. Order matters: protect_cited_fact blocks
   // deleting a fact while a doc_line/coverage still cites it. coverage/doc_line have
   // no marker column of their own, so they are only ever removed via the job cascade.
@@ -189,81 +187,56 @@ async function sweep(svc) {
   try { await svc.from("fact").delete().like("content", MARK_PREFIX + "%"); } catch (e) { console.error("  sweep warn (fact):", e.message); }
 }
 
-async function seedSentinelGraph(svc) {
+// Seed TWO probe rows per table (so an UNFILTERED anon read proves "every row", and
+// update vs delete probes get independent targets). requirement gets a 3rd row with
+// no coverage, so the coverage INSERT probe has a non-colliding composite PK.
+async function seedRows(svc) {
   const ins = async (table, payload, cols) => {
     const { data, error, status } = await svc.from(table).insert(payload).select(cols).single();
     if (error) throw new Error(`seed ${table} (status ${status}): ${error.message}`);
     return data;
   };
-  seed.fact = (await ins("fact", { type: "skill", content: MARK }, "id")).id;
-  seed.job = (await ins("job", { raw_text: MARK }, "id")).id;
-  seed.requirement = (await ins("requirement", { job_id: seed.job, text: MARK, kind: "must" }, "id")).id;
-  // A 2nd requirement gives the anon coverage WRITE probe a non-colliding composite PK,
-  // so an (anon-insert-allowed) leak surfaces as a clean FAIL, not a PK-collision CNV.
-  seed.requirement2 = (await ins("requirement", { job_id: seed.job, text: MARK, kind: "nice" }, "id")).id;
-  seed.document = (await ins("document", { job_id: seed.job, type: "resume" }, "id")).id;
-  // coverage has a composite PK (job_id, requirement_id) and no surrogate id.
-  await ins("coverage", { job_id: seed.job, requirement_id: seed.requirement, status: "met", fact_ids: [seed.fact] }, "job_id");
-  seed.doc_line = (await ins("doc_line", { document_id: seed.document, text: MARK, fact_ids: [seed.fact] }, "id")).id;
+  ids.fact = [(await ins("fact", { type: "skill", content: MARK }, "id")).id,
+              (await ins("fact", { type: "skill", content: MARK }, "id")).id];
+  ids.job = [(await ins("job", { raw_text: MARK }, "id")).id,
+             (await ins("job", { raw_text: MARK }, "id")).id];
+  const J = ids.job[0];
+  ids.requirement = [(await ins("requirement", { job_id: J, text: MARK, kind: "must" }, "id")).id,
+                     (await ins("requirement", { job_id: J, text: MARK, kind: "nice" }, "id")).id,
+                     (await ins("requirement", { job_id: J, text: MARK, kind: "keyword" }, "id")).id];
+  ids.document = [(await ins("document", { job_id: J, type: "resume" }, "id")).id,
+                  (await ins("document", { job_id: J, type: "resume" }, "id")).id];
+  // coverage PK is composite (job_id, requirement_id); seed on requirement[0] and [1].
+  await ins("coverage", { job_id: J, requirement_id: ids.requirement[0], status: "met", fact_ids: [ids.fact[0]] }, "job_id");
+  await ins("coverage", { job_id: J, requirement_id: ids.requirement[1], status: "met", fact_ids: [ids.fact[0]] }, "job_id");
+  ids.coverage = [{ job_id: J, requirement_id: ids.requirement[0] }, { job_id: J, requirement_id: ids.requirement[1] }];
+  ids.doc_line = [(await ins("doc_line", { document_id: ids.document[0], text: MARK, fact_ids: [ids.fact[0]] }, "id")).id,
+                  (await ins("doc_line", { document_id: ids.document[0], text: MARK, fact_ids: [ids.fact[0]] }, "id")).id];
 }
 
-// Per-table: positive control (svc must see the sentinel), anon read (filtered to the
-// sentinel id → empty = denied), and anon write. Write payloads are chosen per table so
-// the rejection is attributable: 42501 (RLS) for the trigger-free tables and coverage
-// (unmet + empty fact_ids sidesteps the fact trigger), and 23503 for doc_line (its
-// mandatory fact_ids trigger, run AS anon, cannot see the fact → genuine denial; see
-// classifyWrite's "provenance" branch). doc_line's own RLS is covered by its read check.
-function tableProbes(svc, anon) {
+// Per-table probe config. keyCol = the column to select for existence/leak checks.
+// insertExpect "rls" → expect 42501; "provenance" → doc_line's trigger 23503 is OK.
+// updTarget/delTarget are match() objects; updCol/updVal a change distinct from the
+// seeded value, so svc ground-truth tells denied (unchanged) from leak (changed).
+function tableConfig() {
+  const J = ids.job[0];
   return {
-    fact: {
-      writeExpect: "rls",
-      pc: () => svc.from("fact").select("id").eq("id", seed.fact),
-      read: () => anon.from("fact").select("id").eq("id", seed.fact),
-      write: () => anon.from("fact").insert({ type: "skill", content: MARK + "_w" }).select("id"),
-    },
-    job: {
-      writeExpect: "rls",
-      pc: () => svc.from("job").select("id").eq("id", seed.job),
-      read: () => anon.from("job").select("id").eq("id", seed.job),
-      write: () => anon.from("job").insert({ raw_text: MARK + "_w" }).select("id"),
-    },
-    requirement: {
-      writeExpect: "rls",
-      pc: () => svc.from("requirement").select("id").eq("id", seed.requirement),
-      read: () => anon.from("requirement").select("id").eq("id", seed.requirement),
-      write: () => anon.from("requirement").insert({ job_id: seed.job, text: MARK + "_w", kind: "nice" }).select("id"),
-    },
-    coverage: {
-      // read: the sentinel coverage at (job, requirement). write: a NON-colliding PK
-      // (job, requirement2) with unmet + empty fact_ids (default) — empty avoids the
-      // fact-existence trigger (which, run AS anon, would 23503 before RLS), and the
-      // fresh PK means RLS WITH CHECK is the only blocker left → 42501 when denied, or
-      // a clean insert (FAIL) if anon writes were ever allowed.
-      writeExpect: "rls",
-      pc: () => svc.from("coverage").select("job_id").eq("job_id", seed.job).eq("requirement_id", seed.requirement),
-      read: () => anon.from("coverage").select("job_id").eq("job_id", seed.job).eq("requirement_id", seed.requirement),
-      write: () => anon.from("coverage").insert({ job_id: seed.job, requirement_id: seed.requirement2, status: "unmet" }).select("job_id"),
-    },
-    document: {
-      writeExpect: "rls",
-      pc: () => svc.from("document").select("id").eq("id", seed.document),
-      read: () => anon.from("document").select("id").eq("id", seed.document),
-      write: () => anon.from("document").insert({ job_id: seed.job, type: "cover_letter" }).select("id"),
-    },
-    doc_line: {
-      // doc_line.fact_ids is mandatory + non-empty, so its fact-existence trigger
-      // ALWAYS fires; run AS anon it cannot see the sentinel fact and rejects with
-      // 23503 before RLS WITH CHECK — a genuine denial (see classifyWrite/provenance).
-      // doc_line's OWN RLS is proven independently by the read check above.
-      writeExpect: "provenance",
-      pc: () => svc.from("doc_line").select("id").eq("id", seed.doc_line),
-      read: () => anon.from("doc_line").select("id").eq("id", seed.doc_line),
-      write: () => anon.from("doc_line").insert({ document_id: seed.document, text: MARK + "_w", fact_ids: [seed.fact] }).select("id"),
-    },
+    fact:        { keyCol: "id",     insertExpect: "rls",        insertPayload: { type: "skill", content: MARK + "_w" },
+                   updTarget: { id: ids.fact[0] },        updCol: "role",   updVal: MARK + "_u", delTarget: { id: ids.fact[1] } },
+    job:         { keyCol: "id",     insertExpect: "rls",        insertPayload: { raw_text: MARK + "_w" },
+                   updTarget: { id: ids.job[0] },         updCol: "company", updVal: MARK + "_u", delTarget: { id: ids.job[1] } },
+    requirement: { keyCol: "id",     insertExpect: "rls",        insertPayload: { job_id: J, text: MARK + "_w", kind: "nice" },
+                   updTarget: { id: ids.requirement[0] }, updCol: "kind",   updVal: "keyword",   delTarget: { id: ids.requirement[1] } },
+    coverage:    { keyCol: "job_id", insertExpect: "rls",        insertPayload: { job_id: J, requirement_id: ids.requirement[2], status: "unmet" },
+                   updTarget: ids.coverage[0],            updCol: "status", updVal: "partial",   delTarget: ids.coverage[1] },
+    document:    { keyCol: "id",     insertExpect: "rls",        insertPayload: { job_id: J, type: "cover_letter" },
+                   updTarget: { id: ids.document[0] },    updCol: "status", updVal: "approved",  delTarget: { id: ids.document[1] } },
+    doc_line:    { keyCol: "id",     insertExpect: "provenance", insertPayload: { document_id: ids.document[0], text: MARK + "_w", fact_ids: [ids.fact[0]] },
+                   updTarget: { id: ids.doc_line[0] },    updCol: "approved", updVal: true,      delTarget: { id: ids.doc_line[1] } },
   };
 }
 
-// ── Part A: anon RLS denial ────────────────────────────────────────────────────────
+// ── Part A: anon RLS denial (read + insert + update + delete) ───────────────────────
 async function partA() {
   const URL = env("SUPABASE_URL");
   const SVC_KEY = env("SUPABASE_SERVICE_ROLE_KEY");
@@ -284,7 +257,7 @@ async function partA() {
   if (anonRole === "service_role") return bail("SUPABASE_ANON_KEY decodes to role=service_role — it holds the service key, not the anon key");
   if (svcRole === "anon") return bail("SUPABASE_SERVICE_ROLE_KEY decodes to role=anon — service var holds the anon key; seeding would fail");
   if (anonRole && anonRole !== "anon") return bail(`SUPABASE_ANON_KEY decodes to role=${anonRole}, expected anon`);
-  const roleNote = anonRole === "anon" ? "role=anon (JWT verified)" : "role pre-check skipped (non-JWT key) — relying on sentinel contrast";
+  const roleNote = anonRole === "anon" ? "role=anon (JWT verified)" : "role pre-check skipped (non-JWT key) — relying on service-role ground truth";
 
   const opts = { auth: { persistSession: false, autoRefreshToken: false } };
   const svc = createClient(URL, SVC_KEY, opts);
@@ -292,66 +265,97 @@ async function partA() {
 
   console.log(`project ${projectRef(URL)} — anon ${roleNote}`);
 
-  // Recover from any crashed prior run before seeding.
-  await sweep(svc);
-
+  await sweep(svc); // recover from any crashed prior run before seeding
   try {
-    await seedSentinelGraph(svc);
+    await seedRows(svc);
   } catch (e) {
-    return bail(`could not seed sentinel graph via service role: ${e.message}`);
+    return bail(`could not seed probe rows via service role: ${e.message}`);
   }
-  console.log(`seeded sentinel graph (marker ${MARK})\n`);
+  console.log(`seeded 2 probe rows per table (marker ${MARK})\n`);
 
-  const probes = tableProbes(svc, anon);
+  const cfg = tableConfig();
 
-  // Positive controls: svc MUST see every sentinel, else the environment proves nothing.
+  // ── READ: anon UNFILTERED select must return 0, while svc proves the table is non-empty.
   for (const t of TABLE_NAMES) {
-    const res = await probes[t].pc();
-    const ok = res.status !== 0 && res.status !== 404 && !res.error && Array.isArray(res.data) && res.data.length === 1;
-    if (!ok) {
-      return bail(`positive control failed for ${t}: service role could not read the sentinel (status=${res.status}, rows=${Array.isArray(res.data) ? res.data.length : "?"}, err=${res.error?.message || "none"})`);
+    const c = cfg[t];
+    const svcAll = await svc.from(t).select(c.keyCol);
+    if (svcAll.error || !Array.isArray(svcAll.data) || svcAll.data.length < 2) {
+      record(`${t} read`, "CNV", `svc could not confirm >=2 rows exist (status=${svcAll.status}, rows=${Array.isArray(svcAll.data) ? svcAll.data.length : "?"}, err=${short(svcAll.error) || "none"}) — environment proves nothing`);
+      continue;
     }
+    const [v, d] = classifyRead(await anon.from(t).select(c.keyCol));
+    record(`${t} read`, v, `${d} (svc sees ${svcAll.data.length})`);
   }
 
-  // The actual security assertions: anon denied a read and a write on every table.
+  // ── INSERT: anon attempt must be rejected (42501 RLS; doc_line provenance), no row created.
   for (const t of TABLE_NAMES) {
-    const [rv, rd] = classifyRead(await probes[t].read());
-    record("A", `${t} read`, rv, rd);
+    const c = cfg[t];
+    const [v, d] = classifyInsert(await anon.from(t).insert(c.insertPayload).select(c.keyCol), c.insertExpect);
+    record(`${t} insert`, v, d);
+    // a leaked insert carries our marker; the finally sweep removes it.
+  }
 
-    const wres = await probes[t].write();
-    const [wv, wd] = classifyWrite(wres, probes[t].writeExpect);
-    record("A", `${t} write`, wv, wd);
-    // If anon's write LEAKED, the row carries our marker; the finally sweep removes it.
+  // ── UPDATE: anon attempt, then SERVICE-ROLE GROUND TRUTH — did the column actually change?
+  for (const t of TABLE_NAMES) {
+    const c = cfg[t];
+    const before = await svc.from(t).select(c.updCol).match(c.updTarget).maybeSingle();
+    if (before.error || !before.data) { record(`${t} update`, "CNV", `svc could not read update target before (${short(before.error) || "missing"})`); continue; }
+    const original = before.data[c.updCol];
+    const up = await anon.from(t).update({ [c.updCol]: c.updVal }).match(c.updTarget).select(c.keyCol);
+    if (up.status === 0) { record(`${t} update`, "CNV", `transport failure on anon update (status 0)`); continue; }
+    const after = await svc.from(t).select(c.updCol).match(c.updTarget).maybeSingle();
+    if (after.error || !after.data) { record(`${t} update`, "CNV", `svc could not re-read update target after (${short(after.error) || "missing"})`); continue; }
+    const now = after.data[c.updCol];
+    if (now === original) record(`${t} update`, "PASS", `anon UPDATE denied — ${c.updCol} unchanged (svc-verified: ${JSON.stringify(now)})`);
+    else record(`${t} update`, "FAIL", `LEAK — anon UPDATE changed ${c.updCol} ${JSON.stringify(original)} -> ${JSON.stringify(now)}`);
+  }
+
+  // ── DELETE: anon attempt, then SERVICE-ROLE GROUND TRUTH — is the row still there?
+  for (const t of TABLE_NAMES) {
+    const c = cfg[t];
+    const before = await svc.from(t).select(c.keyCol).match(c.delTarget);
+    if (before.error || !Array.isArray(before.data) || before.data.length !== 1) { record(`${t} delete`, "CNV", `svc could not confirm delete target exists before (${short(before.error) || "missing"})`); continue; }
+    const del = await anon.from(t).delete().match(c.delTarget).select(c.keyCol);
+    if (del.status === 0) { record(`${t} delete`, "CNV", `transport failure on anon delete (status 0)`); continue; }
+    const after = await svc.from(t).select(c.keyCol).match(c.delTarget);
+    if (after.error || !Array.isArray(after.data)) { record(`${t} delete`, "CNV", `svc could not re-read delete target after (${short(after.error)})`); continue; }
+    if (after.data.length === 1) record(`${t} delete`, "PASS", `anon DELETE denied — row still present (svc-verified)`);
+    else record(`${t} delete`, "FAIL", `LEAK — anon DELETE removed the row`);
   }
 }
 
-// ── Part B: server-only build guard ────────────────────────────────────────────────
+// ── Part B: server-only build guard (attributable) ─────────────────────────────────
+function buildOnce() {
+  rmSync(NEXT_DIR, { recursive: true, force: true }); // fresh: defeat stale/partial Turbopack cache
+  const res = spawnSync(process.execPath, [NEXT_BIN, "build"], {
+    cwd: REPO, encoding: "utf8", maxBuffer: 128 * 1024 * 1024, env: process.env,
+  });
+  return { status: res.status, error: res.error, out: `${res.stdout || ""}\n${res.stderr || ""}` };
+}
+
 function partB() {
   if (existsSync(PROBE_DIR)) cleanupProbeSync(); // refuse to trust a stale probe
   try {
-    rmSync(NEXT_DIR, { recursive: true, force: true }); // defeat stale/partial Turbopack cache
+    // Control: with NO probe, the app must build GREEN — else we cannot attribute a
+    // later failure to the probe rather than to pre-existing breakage.
+    const base = buildOnce();
+    if (base.error) { record("build guard", "CNV", `next could not run (baseline): ${base.error.message}`); return; }
+    if (base.status !== 0) { record("build guard", "CNV", `baseline build (no probe) FAILED (exit ${base.status}) — app not green; cannot attribute the guard failure`); return; }
+
+    // Now add the Client Component that imports the db client and build again.
     mkdirSync(PROBE_DIR, { recursive: true });
     writeFileSync(PROBE_FILE, PROBE_TSX, "utf8");
+    const probe = buildOnce();
+    if (probe.error) { record("build guard", "CNV", `next could not run (probe): ${probe.error.message}`); return; }
 
-    const res = spawnSync(process.execPath, [NEXT_BIN, "build"], {
-      cwd: REPO,
-      encoding: "utf8",
-      maxBuffer: 128 * 1024 * 1024,
-      env: process.env,
-    });
-
-    if (res.error) {
-      record("B", "build guard", "CNV", `next could not run: ${res.error.message}`);
-      return;
-    }
-    const out = `${res.stdout || ""}\n${res.stderr || ""}`;
-    const attributable = out.includes(SIG_PKG) && out.includes(SIG_BOUNDARY);
-    if (res.status === 0) {
-      record("B", "build guard", "FAIL", "next build SUCCEEDED — a Client Component imported the service-role client without error");
+    const o = probe.out;
+    const attributable = o.includes(SIG_BOUNDARY) && o.includes(SIG_PKG) && o.includes(SIG_PROBE) && SIG_CLIENT.test(o);
+    if (probe.status === 0) {
+      record("build guard", "FAIL", "probe build SUCCEEDED — the server-only guard did NOT block a Client Component importing the service-role client");
     } else if (attributable) {
-      record("B", "build guard", "PASS", `next build failed with the server-only client-boundary error (exit ${res.status})`);
+      record("build guard", "PASS", `baseline built green; probe build failed with the server-only error naming security-probe/page.tsx -> src/lib/db/client.ts (exit ${probe.status})`);
     } else {
-      record("B", "build guard", "CNV", `next build failed (exit ${res.status}) WITHOUT the server-only signature — unrelated breakage, not proof`);
+      record("build guard", "CNV", `probe build failed (exit ${probe.status}) but NOT attributable to our probe importing client.ts — unrelated breakage, not proof`);
     }
   } finally {
     cleanupProbeSync();
@@ -368,7 +372,7 @@ function partB() {
     if (URL && SVC_KEY && jwtRole(SVC_KEY) !== "anon") svcForCleanup = createClient(URL, SVC_KEY, opts);
   } catch {}
 
-  console.log("=== Veritas security proof — anon RLS denial + server-only build guard ===\n");
+  console.log("=== Veritas security proof — anon RLS denial (read+insert+update+delete) + server-only build guard ===\n");
 
   try {
     await partA();
@@ -378,8 +382,8 @@ function partB() {
     if (svcForCleanup) await sweep(svcForCleanup); // always leave the DB as we found it
   }
 
-  // Only run the (slow) build if the DB environment actually verified; a precondition
-  // failure means "fix your env, then re-run", not "spend 60s building".
+  // Only run the (slow, 2x) build if the DB environment actually verified; a
+  // precondition failure means "fix your env, then re-run", not "spend time building".
   if (!fatal) partB();
 
   // ── tally ──
@@ -406,6 +410,6 @@ function partB() {
     console.log(`✗ COULD NOT VERIFY — ${cnvs.length} check(s) inconclusive. No full proof produced; this is NOT a pass.`);
     process.exit(2);
   }
-  console.log("✓ SECURITY PROVED — anon denied a read and a write on all six tables; the server-only client-import build guard holds.");
+  console.log("✓ SECURITY PROVED — anon denied read + insert + update + delete on all six tables; the server-only client-import build guard holds attributably.");
   process.exit(0);
 }
