@@ -6,6 +6,7 @@ What you (the agent) must know that isn't obvious from the code
 The core invariant: doc_line.fact_ids must be non-empty and reference real facts. The validation layer (src/lib/provenance/) enforces this. Never weaken, bypass, or "temporarily disable" it.
 No ATS scores. Do not add scoring features even if they seem helpful. We show requirement coverage (met/partial/unmet) with evidence only.
 Banned-words list lives in src/lib/provenance/banned.ts ("spearheaded", "leveraged", "synergize", etc.). Generation output containing them fails validation.
+The banned-words list must never reject a truthful, sourced line. Ambiguous words (those with legitimate technical meaning, e.g. 'dynamic') should warn, not hard-block — refusing to forbid the truth takes priority over catching every cliché.
 Voice: generation is conditioned on the user's writing samples (facts of type writing_sample). Output should sound like the user, not like a press release.
 LLM calls use Anthropic structured outputs; every generation step must return fact citations alongside text.
 Source code reference (use this instead of docs)
