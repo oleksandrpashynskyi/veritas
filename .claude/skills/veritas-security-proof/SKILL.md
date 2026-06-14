@@ -104,6 +104,20 @@ do not merge), `2` = could not verify (fix the cause and re-run; never treat as 
   prior-crash recovery on the way in; the probe dir is removed in `finally` and on
   SIGINT/SIGTERM, and is gitignored as a backstop.
 
+## Known limitation (deferred hardening) — postgrest-js 404 normalization
+Write-denial rests on service-role ground truth **plus** a "did the write reach
+Postgres?" check (`dbProcessed`). That check uses "no error" as a proxy, which is not
+perfect: postgrest-js `PostgrestBuilder.processResponse` normalizes some 404s into
+error-free responses — a 404 whose body is a JSON **array** becomes `{data:[],
+error:null, status:200}`, and a 404 with an **empty** body becomes `status:204`. The
+proof tightens for the 204 / residual-404 case (treated as COULD NOT VERIFY), but the
+**array-body → `200 []`** case is indistinguishable from a genuine RLS-filtered `200 []`
+and is left as **deferred hardening**. In practice it cannot mask a real leak: a 404
+write body is an error object (not an array), and the same-table service-role
+ground-truth reads would themselves CNV if the table were truly missing — but a
+dedicated pass should make "reached Postgres" explicit (e.g. assert on a returned
+representation / row count) rather than inferring it from the absence of an error.
+
 ## Deferred — the `authenticated` role
 This proof covers the **anon** role, which is the live public attack surface: the
 publishable key ships in browser bundles. The **`authenticated`** role has the

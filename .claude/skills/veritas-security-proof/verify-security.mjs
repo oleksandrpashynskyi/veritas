@@ -161,10 +161,24 @@ function classifyRead({ data, error, status }) {
 // or a Postgres SQLSTATE rejection (42501 RLS, 23xxx constraint/trigger) means yes;
 // a transport failure (status 0) or a non-SQLSTATE error (401/403 JWT, 405, 5xx
 // gateway — error.code like "PGRST301" or empty) means the write never reached RLS.
+//
+// KNOWN EDGE (Codex review #3): "no error" is not a PERFECT proxy for "reached
+// Postgres". postgrest-js PostgrestBuilder.processResponse (node_modules/@supabase/
+// postgrest-js/dist/index.mjs:370-385, src/PostgrestBuilder.ts) normalizes some 404s:
+// a 404 whose body parses to a JSON ARRAY becomes {data:[], error:null, status:200};
+// a 404 with an EMPTY body becomes {error:null, status:204}. So a write that never
+// reached Postgres could arrive here error-free. Cheap tightening applied below: a 200
+// no-op from a `.select()` write is the genuine deny outcome, but 204 and any residual
+// 404 are NOT — treat them as not-processed (→ COULD NOT VERIFY). The array-body→200
+// case is indistinguishable from a real RLS-filtered `200 []` and is left as documented
+// deferred hardening: it cannot occur for a write in practice (a 404 write body is an
+// error object, not an array) and the same-table service-role ground-truth reads would
+// themselves CNV if the table were truly missing — so it cannot mask a real leak.
 function dbProcessed(res) {
-  if (!res || res.status === 0) return false;
-  if (!res.error) return true;
-  return /^[0-9A-Z]{5}$/.test(res.error.code || "");
+  if (!res || res.status === 0) return false;          // transport — never reached the server
+  if (res.status === 404 || res.status === 204) return false; // postgrest-js 404-normalization edge — not a proven RLS denial
+  if (!res.error) return true;                          // executed (2xx); RLS filtered to 0 rows
+  return /^[0-9A-Z]{5}$/.test(res.error.code || "");    // a Postgres SQLSTATE (42501, 23xxx) — not a PGRST/auth/gateway code
 }
 
 // Judge an anon write SOLELY by service-role ground truth: the verdict is the DB's
