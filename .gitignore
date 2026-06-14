@@ -32,10 +32,18 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
 
+# downloaded library source (read-only reference, populated via opensrc)
+/repos/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# veritas-security-proof — transient build probe (written then removed by the skill;
+# ignored so a crashed run can never accidentally commit it)
+/src/app/security-probe/
