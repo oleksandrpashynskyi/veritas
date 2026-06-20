@@ -37,8 +37,9 @@ Review only the code you wrote this session. Where did you duplicate logic that 
 Self-review:
 List the three weakest points of this milestone's code — honestly. Fix any that are genuine defects; leave style preferences alone.
 
-DEFERRED (close before M2 relies on /veritas-security-proof as a gate): 
-verify-security.mjs should adopt the same owned-supabase db reset + same-stack cred-binding (via supabase status, same cwd) that verify.mjs now uses, so the 121-check isolation proof binds to the working-tree migration files rather than the currently-connected schema. Pre-existing pattern from M1; not a regression. Confirm verify-security.mjs's current cred/reset design when picking it up.
+DONE (M1.5 close): verify-security.mjs now adopts the same owned-`supabase db reset` + same-stack cred-binding (via `supabase status`, same cwd) that verify.mjs uses, so the 121-check isolation proof binds to the working-tree migration files, not the currently-connected schema. Plus a post-reset `/auth/v1/health` readiness gate (Kong-wedge mitigation; bounded ~30s → CNV; fails closed) and a graceful exit that no longer crashes on Windows teardown.
+
+DEFERRED (low priority): apply the same post-reset `/auth/v1/health` readiness gate to verify.mjs (invariant smoke test) — same Kong-wedge class, low exposure (one createUser, single reset usually stays routable), already fails closed. Fold in next time verify.mjs is touched.
 
 Commit, small PR.
 Cross-review (after each PR, in the Codex panel)
