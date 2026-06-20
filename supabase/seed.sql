@@ -1,0 +1,5 @@
+-- Intentionally empty. config.toml references ./seed.sql under [db.seed]; this file
+-- exists so `supabase start` / `supabase db reset` does not fail on a missing seed.
+-- The Auth Foundation proof seeds its own (owner-stamped, marker-prefixed) rows at
+-- runtime via the service role and tears them down, so no committed seed data is
+-- needed — and committing user career data would violate AGENTS.md.

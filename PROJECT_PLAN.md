@@ -28,12 +28,12 @@ Application auto-fill
 ATS scores
 Tracking boards / CRM
 Template galleries
-Accounts, auth, payments, multi-user
+Payments / billing; full account management (profiles, social login, password-reset flows). NOTE: basic authentication + per-user data ownership are now IN, added as the M1.5 Auth Foundation milestone so later fact-CRUD is born ownership-aware.
 Mobile
 4. Architecture
 Frontend: Next.js 15 (App Router), TypeScript, Tailwind, shadcn/ui
 Backend: Next.js server actions / route handlers (monolith; no separate service in v1)
-Database: Supabase Postgres (free tier) — but local-first: single user, simple schema
+Database: Supabase Postgres (free tier) — local-first dev; per-user ownership + RLS land in M1.5 (Auth Foundation), so the schema is multi-user-capable while the app runtime stays local and service-role
 LLM: Anthropic API for generation steps (structured outputs with fact citations). Note: app runtime calls are API-billed — keep generation steps few and cached. Claude Code (subscription) is for building, the API is for running.
 Deploy: local dev only for v1; Vercel later if it leaves the nest
 Data model sketch
@@ -48,6 +48,7 @@ The invariant that is the product: doc_line.fact_ids must be non-empty and valid
 
 5. Milestones (one per session, small PRs)
 M1 — Scaffold. Next.js + Supabase wired, schema migrated, repos/ populated via opensrc, AGENTS.md in root.
+M1.5 — Auth Foundation. Supabase Auth (identity) + per-user ownership baked into the schema; RLS isolates the authenticated role; two real users proven isolated by the security proof. App data path stays service-role; per-user client + login UI deferred.
 M2 — Master Profile. CRUD for facts. Seed it with the founder's real career data.
 M3 — Job Ingest. Paste → parsed requirements (LLM structured extraction), stored.
 M4 — Coverage Map. Matching of requirements to facts; honest unmet display.

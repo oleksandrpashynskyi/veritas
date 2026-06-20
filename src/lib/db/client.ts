@@ -5,15 +5,18 @@ import "server-only";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 /**
- * Server-only Supabase client.
+ * Server-only Supabase client (service role).
  *
- * Veritas v1 is a single-user, local-first app with no end-user auth. Data
- * access happens server-side through this client using the service-role key,
- * which bypasses Row Level Security. RLS is nonetheless enabled (deny-by-default,
- * with no anon/authenticated policies) on every table so that the public
- * Supabase API roles cannot read or write career data even if the anon key
- * leaks. Never import this from a Client Component — the key must never reach
- * the browser bundle (the `server-only` import above enforces that).
+ * The app reaches Postgres server-side through this client using the
+ * service-role key, which bypasses Row Level Security. As of the Auth Foundation
+ * milestone (M1.5) the schema is multi-user: career data is owned by an
+ * `auth.users` row and per-user RLS policies isolate the `authenticated` role.
+ * Those policies govern the public API surface (a leaked anon key, or a future
+ * per-user client); the app's own data path still uses the service role, so a
+ * per-user authenticated client and login UI are deferred. RLS stays
+ * deny-by-default for `anon` (zero policies). Never import this from a Client
+ * Component — the service-role key must never reach the browser bundle (the
+ * `server-only` import above enforces that).
  *
  * The client is created lazily so `next build` does not require env vars at
  * module-eval time (and so a missing-config error surfaces at the call site,
