@@ -28,3 +28,6 @@ After completing a feature, identify duplicated code you created and consolidate
 Write tests for the provenance layer for every change that touches it.
 Never install a package published less than 14 days ago.
 Never log or commit the user's personal career data or API keys.
+
+Local dev — Supabase stack gotcha
+`supabase db reset` restarts the auth (GoTrue) container, and the Kong gateway can hold a stale upstream route to it → transient HTTP 502 on auth calls (createUser / sign-in) right after a reset, worst on back-to-back resets. GoTrue itself stays healthy; the wedge clears with `docker restart supabase_kong_resume`. Any reset-then-auth flow must poll `GET {API_URL}/auth/v1/health` until 200 before minting users — the veritas-security-proof harness (verify-security.mjs) does this; the veritas-invariant-smoke-test (verify.mjs) adoption is deferred (low priority, low exposure).

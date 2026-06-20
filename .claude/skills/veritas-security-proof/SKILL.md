@@ -1,8 +1,8 @@
 ---
 name: veritas-security-proof
-description: Prove, by execution against a LOCAL Supabase stack, three security properties — (A) RLS deny-by-default blocks the public anon role from READING any row (an unfiltered select returns 0 while the service role sees the rows) and from WRITING (insert/update/delete on a representative seeded row of each table, judged solely by service-role ground truth) on all six tables; (C) per-user ownership isolation for the authenticated role — two real users A and B cannot read or write each other's rows (read by specific-id presence/absence; cross-user writes judged by service-role ground truth, with positive controls), the Auth Foundation milestone (M1.5); and (B) the server-only guard makes `next build` fail ATTRIBUTABLY when the db client (@/lib/db/client) is imported directly from a Client Component. The proof creates and deletes auth users, so it runs only against a loopback (local) URL. Run before any CRUD touches real career data, and on any change to src/lib/db, the RLS in supabase/migrations, or this script.
+description: Prove, by execution against a LOCAL Supabase stack — which it first resets to the working-tree migrations (so the proof binds to the files about to merge, not a stale connected schema) and then connects to via supabase status — three security properties — (A) RLS deny-by-default blocks the public anon role from READING any row (an unfiltered select returns 0 while the service role sees the rows) and from WRITING (insert/update/delete on a representative seeded row of each table, judged solely by service-role ground truth) on all six tables; (C) per-user ownership isolation for the authenticated role — two real users A and B cannot read or write each other's rows (read by specific-id presence/absence; cross-user writes judged by service-role ground truth, with positive controls), the Auth Foundation milestone (M1.5); and (B) the server-only guard makes `next build` fail ATTRIBUTABLY when the db client (@/lib/db/client) is imported directly from a Client Component. The proof creates and deletes auth users, so it runs only against a loopback (local) URL. Run before any CRUD touches real career data, and on any change to src/lib/db, the RLS in supabase/migrations, or this script.
 disable-model-invocation: true
-argument-hint: "(no arguments; loopback/local stack only; reads .env.test.local; creates/deletes test users; runs next build)"
+argument-hint: "(no arguments; loopback/local stack only; runs db reset + sources creds from supabase status; creates/deletes test users; runs next build)"
 ---
 
 # Veritas security proof
@@ -50,15 +50,36 @@ puts real career data in the database:
   guard cannot escape detection by being relocated off `client.ts`). Proven by actually
   building, so the key can never reach the browser bundle.
 
+## Freshness is owned, and the target is bound
+Like the invariant smoke-test, this proof **runs `supabase db reset` itself** immediately
+before the isolation battery — re-applying the working-tree `supabase/migrations/*.sql`
+(including the RLS/ownership migration) into the local stack — then sources its connection
+(`API_URL` + `ANON_KEY` + `SERVICE_ROLE_KEY`) from **`supabase status -o json`** run in the
+**same cwd**. So it proves the **working-tree RLS migration applied fresh** isolates — not
+whatever schema happened to be connected — and the stack it tests is provably the stack the
+reset reset (same cwd → same `supabase/config.toml` → same instance). **No env URL/key is
+read**, so a divergent `.env` value cannot redirect it at a different (un-reset) stack. A
+`db reset` / `supabase status` failure → COULD NOT VERIFY.
+
+**Auth-readiness gate (post-reset).** `db reset` restarts the auth container, and the Kong
+gateway can briefly hold a stale route to it (transient **502**) even though GoTrue is
+healthy. So before minting any user the proof polls the gateway's `/auth/v1/health` until
+**200** (bounded ~30s); on timeout it bails to **COULD NOT VERIFY** with a `docker restart
+supabase_kong_resume` hint — it never runs the battery against a not-ready stack, and it
+**fails closed**. This gates only *whether* the battery runs, never how it judges.
+
 ## The one hard rule
 The run MUST exit non-zero with **"COULD NOT VERIFY"** if it cannot prove a property —
-a non-loopback `SUPABASE_URL`, a transport/connection failure, a 404, a service-role
+a failed `supabase db reset` or `supabase status`, a non-loopback reset target, a
+transport/connection failure, a 404, a service-role
 check that can't confirm the seeded rows or the post-write DB state, an anon write that
 never reached RLS (auth/gateway/transport), a positive control that fails (the owner
 couldn't touch its own row), a build that can't run / a non-green baseline / a failure
 not attributable to our probe, or fewer than the **121** registered checks executing. An
-empty or partial result is a FAILURE, never a pass. Report success only when all 121
-checks ran and passed. The bundled script enforces this; do not work around it.
+empty or partial result is a FAILURE, never a pass. And even when all 121 pass, if the
+teardown can't be confirmed clean (sweep/delete errored, or marker rows / A-B users remain)
+the run exits **3 (cleanup leak)**, not 0. Report success only when all 121 checks ran and
+passed **and** the stack was left clean. The bundled script enforces this; do not work around it.
 
 ## What it checks
 | Property | Probe | Pass condition |
@@ -83,33 +104,34 @@ together are the regression that proves the revoke denied `anon` and broke neith
 `authenticated` nor the `service_role` path.
 
 ## No secrets here
-The bundled `verify-security.mjs` reads `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and
-`SUPABASE_ANON_KEY` at run time from `<repo>/.env.test.local` (preferred — the local
-stack's creds, written from `supabase status -o env`) or `<repo>/.env.local` (both
-gitignored). On a local stack these are the well-known demo keys; they still live only in
-an env file, never in this skill or any committed file. Before running, decode the keys'
-JWT `role` claim and **refuse to run** if the anon var is actually the service key, and
-**refuse to run** unless `SUPABASE_URL` is loopback (`127.0.0.1`/`localhost`) — the proof
-creates and deletes auth users, so it must never touch a remote/production project.
+The bundled `verify-security.mjs` sources `API_URL`, `SERVICE_ROLE_KEY` and `ANON_KEY` at
+run time from **`supabase status -o json`** (the running local stack) — not from any env or
+committed file. On a local stack these are the well-known demo keys; nothing credential-like
+is stored in this skill. Before running, it decodes the sourced keys' JWT `role` claim and
+**refuses to run** if the anon key is actually the service key (or vice-versa), and **refuses
+to run** unless the reset target's `API_URL` is loopback (`127.0.0.1`/`localhost`) — the proof
+resets the DB and creates/deletes auth users, so it must never touch a remote/production project.
 
 ## Run it
-No throwaway install — `@supabase/supabase-js` and `next` are already project deps.
-Bring up the local stack (`supabase start`) and write its creds to `.env.test.local`,
-then from the repo root:
+No throwaway install — `@supabase/supabase-js` and `next` are already project deps, and the
+proof runs `db reset` and sources its own creds (from `supabase status`) for you. Just bring
+up the local stack (`supabase start`), then from the repo root:
 
 ```
 node .claude/skills/veritas-security-proof/verify-security.mjs "$PWD"
 ```
 
-It refuses unless `SUPABASE_URL` is loopback, creates two test users (A, B) via the Admin
-API, seeds owner-stamped probe rows via the service role, runs the **24 anon** checks
+It **resets the local DB** to the working-tree migrations (≈30–60s), refuses unless the
+reset target is loopback, creates two test users (A, B) via the Admin API, seeds
+owner-stamped probe rows via the service role, runs the **24 anon** checks
 (read/insert/update/delete × 6) and the **96 authenticated-isolation** checks (users A vs
 B, **both directions**, read + write, all six tables — each battery self-seeds), then builds
 once **without** a probe (must be green) and once **with** a temporary
 `src/app/security-probe/page.tsx` (must fail attributably), removing the probe and deleting
-the test users after. Exit `0` = proved (all 121 checks), `1` = regression (a
-leak or a broken guard — STOP, do not merge), `2` = could not verify (fix the cause and
-re-run; never treat as a pass).
+the test users after. Exit `0` = proved (all 121 checks) and the stack left clean, `1` =
+regression (a leak or a broken guard — STOP, do not merge), `2` = could not verify (fix the
+cause and re-run; never treat as a pass), `3` = cleanup leak (every check passed but probe
+rows / A-B users were left behind — distinct from the security result).
 
 ## How it refuses to lie
 - **Reads are unfiltered**, judged against a service-role count: anon must return 0
@@ -156,11 +178,16 @@ re-run; never treat as a pass).
   `@/lib/db/client` **directly** (not the barrel `@/lib/db`) and never `server-only`
   itself, so the build fails solely because `client.ts` carries the guard (remove the
   guard → the build goes green → this check FAILs).
-- It leaves the database, the auth users, and the working tree exactly as it found them:
-  a marker-prefixed sweep removes the probe rows (and any leaked rows), the two test users
-  are deleted (cascading their owned rows), both on the way out (`finally`) and on a
-  prior-crash recovery on the way in; the probe dir is removed in `finally` and on
-  SIGINT/SIGTERM, and is gitignored as a backstop.
+- It owns the database state via the up-front `db reset` (which wipes the local DB and
+  re-applies the working-tree migrations — fine for a disposable local stack, and it also
+  recovers any crashed prior run), and leaves the auth users and the working tree clean: a
+  marker-prefixed sweep removes the probe rows (and any leaked rows), the two test users are
+  deleted (cascading their owned rows), both on the way out (`finally`) and on a prior-crash
+  recovery on the way in; the probe dir is removed in `finally` and on SIGINT/SIGTERM, and is
+  gitignored as a backstop. **The teardown is verified, not assumed**: the sweep/delete now
+  surface their Supabase `{ error }`s, and a post-sweep re-count of marker rows + A/B users
+  must come back empty — if a check otherwise passed but cleanup failed or left anything
+  behind, that is a **CLEANUP LEAK (exit 3)**, not a pass (mirrors verify.mjs).
 
 ## Known limitation (deferred hardening) — postgrest-js 404 normalization
 Anon write-denial rests on service-role ground truth **plus** a "did the write reach
@@ -210,6 +237,6 @@ This supersedes the earlier "deferred until Supabase Auth lands" note.
   a probe that imports `@/lib/db/client` directly.
 - Add a permissive anon policy, or scope an ownership policy to `public`/anon instead of
   `to authenticated`, to "make it pass" — anon must keep zero applicable policies.
-- Point this at a non-local project, or commit `.env.test.local` — it creates and deletes
-  auth users, refuses a non-loopback URL, and the env file is gitignored for a reason.
+- Point this at a non-local project — it resets the DB and creates/deletes auth users, so it
+  refuses a non-loopback reset target.
 - Skip this because "it passed before" — the change in front of you is unverified.

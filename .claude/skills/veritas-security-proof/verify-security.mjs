@@ -34,13 +34,33 @@
 //   1  a real regression: a row leaked / a write crossed an isolation boundary, OR the
 //      build did not fail attributably on the client-boundary violation.
 //   2  COULD NOT VERIFY: any precondition/transport/attribution/ground-truth failure, a
-//      non-loopback URL, an unexpected outcome, or fewer than the registered checks ran.
+//      non-loopback URL, a db reset / supabase status / auth-readiness failure, an
+//      unexpected outcome, or fewer than the registered checks ran.
+//   3  CLEANUP LEAK: every check passed, but the proof did not leave the stack clean —
+//      probe rows / A-B test users left behind, or the sweep/delete errored (distinct from
+//      the security result; matches verify.mjs's exit-3 semantics).
 //
-// NO SECRET IS STORED IN THIS FILE. SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY /
-// SUPABASE_ANON_KEY are read at run time from <repo>/.env.test.local (preferred) or
-// <repo>/.env.local.
+// FRESHNESS IS OWNED, AND THE TARGET IS BOUND (same pattern as the invariant smoke-test).
+// Before the isolation battery this proof runs `supabase db reset` ITSELF (re-applying the
+// working-tree supabase/migrations/*.sql into the local stack), then sources its connection
+// (API_URL + ANON_KEY + SERVICE_ROLE_KEY) from `supabase status -o json` run in the SAME cwd.
+// So the schema it tests is the working-tree RLS migration applied FRESH — not whatever
+// happens to be connected — and the stack it connects to is provably the stack the reset
+// reset (same cwd → same supabase/config.toml → same instance). No env URL/key is read, so
+// there is no second target that could silently point at a different (un-reset) stack. A
+// reset/status failure → CNV.
 //
-// Usage (from the repo root):
+// AUTH-READINESS GATE: `db reset` restarts the auth container, and the Kong gateway can hold
+// a stale route to it (transient 502) right after. So before minting any user the proof polls
+// the gateway's /auth/v1/health until 200 (bounded ~30s); on timeout it bails to CNV with a
+// `docker restart supabase_kong_resume` hint — it never runs the battery against a not-ready
+// stack. This gates only WHETHER the battery runs, never how it judges.
+//
+// NO SECRET IS STORED IN THIS FILE. API_URL / SERVICE_ROLE_KEY / ANON_KEY come from the
+// running local stack (`supabase status`) at run time; on a local stack these are the
+// well-known demo keys.
+//
+// Usage (local stack up; from the repo root):
 //   node .claude/skills/veritas-security-proof/verify-security.mjs        # repo = cwd
 //   node .claude/skills/veritas-security-proof/verify-security.mjs <repo-root>
 import { createClient } from "@supabase/supabase-js";
@@ -49,16 +69,12 @@ import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
 
 const REPO = process.argv[2] || process.cwd();
-const ENV_FILE = existsSync(path.join(REPO, ".env.test.local"))
-  ? path.join(REPO, ".env.test.local")
-  : path.join(REPO, ".env.local");
 const NEXT_DIR = path.join(REPO, ".next");
 const NEXT_BIN = path.join(REPO, "node_modules", "next", "dist", "bin", "next");
 const PROBE_DIR = path.join(REPO, "src", "app", "security-probe");
@@ -89,21 +105,54 @@ const SIG_CLIENT = "client.ts";
 // The six tables, in FK dependency order (parents before children) for seeding.
 const TABLE_NAMES = ["fact", "job", "requirement", "coverage", "document", "doc_line"];
 
-// ── .env parsing (no dotenv dep, no secret here) ────────────────────────────────────
-function envValue(predicate) {
-  const txt = readFileSync(ENV_FILE, "utf8");
-  for (const ln of txt.split(/\r?\n/)) {
-    const m = ln.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/);
-    if (!m) continue;
-    if (predicate(m[1].toUpperCase())) {
-      let v = m[2].trim();
-      if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v[v.length - 1] === v[0]) v = v.slice(1, -1);
-      return v;
-    }
-  }
-  return undefined;
+// ── owned reset + same-stack cred sourcing (no .env, no secret here) ─────────────────
+// Both commands run in `cwd: REPO`, so both resolve the same supabase/config.toml → the
+// same local stack: reset-target == test-target by construction.
+function dbReset() {
+  const res = spawnSync("npx supabase db reset", { cwd: REPO, shell: true, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  return { status: res.status, error: res.error, out: `${res.stdout || ""}\n${res.stderr || ""}` };
 }
-const env = (name) => envValue((k) => k === name);
+// The JSON is on stdout; the "Stopped services" note and version banner go to stderr — so
+// slice the first `{`…last `}` defensively before parsing.
+function statusJson() {
+  const res = spawnSync("npx supabase status -o json", { cwd: REPO, shell: true, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (res.error) return { error: res.error };
+  const out = res.stdout || "";
+  const s = out.indexOf("{"), e = out.lastIndexOf("}");
+  let creds = null, parseErr = null;
+  if (s !== -1 && e > s) { try { creds = JSON.parse(out.slice(s, e + 1)); } catch (err) { parseErr = err.message; } }
+  return { status: res.status, creds, err: `${parseErr ? "parse error: " + parseErr + "\n" : ""}${res.stderr || ""}` };
+}
+
+// After `db reset` the auth (GoTrue) container restarts, and the Kong gateway can briefly
+// hold a STALE route to it (HTTP 502) even though GoTrue itself is healthy. Poll the
+// gateway's `/auth/v1/health` — the SAME route the auth Admin API uses, so a 200 means Kong
+// has re-resolved to the restarted container and createUser will work — until ready. BOUNDED:
+// on timeout the caller bails to CNV; it NEVER proceeds (fail closed). This gates only whether
+// the battery runs, never how it judges.
+async function waitForAuthReady(apiUrl, capMs = 30000, everyMs = 750, perAttemptMs = 5000) {
+  const deadline = Date.now() + capMs;
+  let last = "no response";
+  for (;;) {
+    // Per-attempt timeout: abort a fetch that connects but STALLS before sending headers
+    // (undici's own headersTimeout is ~5 min, and the deadline is only checked once fetch
+    // settles — so without this a hung gateway hangs the loop forever). The abort rejects →
+    // we record not-ready → the overall wait stays bounded by capMs and still times out to CNV.
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), perAttemptMs);
+    try {
+      const r = await fetch(`${apiUrl}/auth/v1/health`, { signal: ac.signal });
+      if (r.status === 200) return { ready: true };
+      last = `HTTP ${r.status}`;
+    } catch (e) {
+      last = `fetch error: ${(e.message || "").split("\n")[0]}`;
+    } finally {
+      clearTimeout(t);
+    }
+    if (Date.now() >= deadline) return { ready: false, last };
+    await new Promise((res) => setTimeout(res, everyMs));
+  }
+}
 
 function jwtClaims(token) {
   if (typeof token !== "string") return undefined;
@@ -295,23 +344,62 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
 // ── DB seed / sweep cleanup ────────────────────────────────────────────────────────
 const ids = {}; // Part A seeded row ids (+ ids.owner)
 let SVC = null; // module-scope service client, so cleanup runs even if setup() bails
+let cleanupStatus = null; // teardown result, so the tally can gate a cleanup leak (exit 3)
 
 async function sweep(svc) {
   // Delete marked jobs (cascades requirement/coverage and document/doc_line), THEN the
   // now-uncited marked facts. Order matters: protect_cited_fact blocks deleting a fact
-  // while a doc_line/coverage still cites it.
-  try { await svc.from("job").delete().like("raw_text", MARK_PREFIX + "%"); } catch (e) { console.error("  sweep warn (job):", e.message); }
-  try { await svc.from("fact").delete().like("content", MARK_PREFIX + "%"); } catch (e) { console.error("  sweep warn (fact):", e.message); }
+  // while a doc_line/coverage still cites it. Returns the errors it hit — inspecting the
+  // Supabase `{ error }` (not just thrown exceptions) so a swallowed failure can't hide.
+  const errors = [];
+  const del = async (table, col) => {
+    try { const r = await svc.from(table).delete().like(col, MARK_PREFIX + "%"); if (r.error) errors.push(`${table} sweep: ${(r.error.code || r.status || "") + " " + (r.error.message || "").split("\n")[0]}`.trim()); }
+    catch (e) { errors.push(`${table} sweep threw: ${(e.message || "").split("\n")[0]}`); }
+  };
+  await del("job", "raw_text");
+  await del("fact", "content");
+  return errors;
 }
 
 async function deleteTestUsers(svc) {
+  // Returns the errors it hit (list + per-user delete), so a swallowed failure can't hide.
+  const errors = [];
   try {
-    const { data } = await svc.auth.admin.listUsers({ page: 1, perPage: 1000 });
+    const { data, error } = await svc.auth.admin.listUsers({ page: 1, perPage: 1000 });
+    if (error) errors.push(`listUsers: ${(error.message || "").split("\n")[0]}`);
     const emails = new Set([TEST_USERS.A.email, TEST_USERS.B.email]);
     for (const u of data?.users || []) {
-      if (emails.has(u.email)) { try { await svc.auth.admin.deleteUser(u.id); } catch {} }
+      if (emails.has(u.email)) { const d = await svc.auth.admin.deleteUser(u.id); if (d.error) errors.push(`deleteUser(${u.email}): ${(d.error.message || "").split("\n")[0]}`); }
     }
-  } catch {}
+  } catch (e) { errors.push(`user delete threw: ${(e.message || "").split("\n")[0]}`); }
+  return errors;
+}
+
+// Re-count marker rows + re-check the A/B users AFTER the sweep — a swallowed cleanup failure
+// can't hide here. Mirrors verify.mjs's exit-3 (cleanup-leak) semantics.
+async function confirmClean(svc, errors) {
+  const count = async (table, col) => {
+    try { const r = await svc.from(table).select("*", { count: "exact", head: true }).like(col, MARK_PREFIX + "%"); return r.error ? `err:${r.error.code || r.status}` : r.count; }
+    catch (e) { return "threw"; }
+  };
+  const leftJobs = await count("job", "raw_text");
+  const leftFacts = await count("fact", "content");
+  let usersPresent = "unknown";
+  try {
+    const { data, error } = await svc.auth.admin.listUsers({ page: 1, perPage: 1000 });
+    if (error) {
+      // The final user re-check ITSELF errored — cleanup is UNCONFIRMED, not "0 users present".
+      // Record it and leave usersPresent non-numeric so clean stays false (→ exit 3); do NOT
+      // derive usersPresent=0 from undefined data.
+      errors.push(`confirmClean listUsers: ${(error.message || "").split("\n")[0]}`);
+      usersPresent = `unconfirmed(${error.status || error.code || "error"})`;
+    } else {
+      const emails = new Set([TEST_USERS.A.email, TEST_USERS.B.email]);
+      usersPresent = (data?.users || []).filter((u) => emails.has(u.email)).length;
+    }
+  } catch (e) { errors.push(`confirmClean listUsers threw: ${(e.message || "").split("\n")[0]}`); usersPresent = "unconfirmed(threw)"; }
+  const clean = errors.length === 0 && leftJobs === 0 && leftFacts === 0 && usersPresent === 0;
+  return { clean, errors, leftJobs, leftFacts, usersPresent };
 }
 
 async function createTestUser(svc, email) {
@@ -382,16 +470,29 @@ function tableConfig() {
 
 // ── shared setup: env, loopback guard, clients, users, Part A seeding ───────────────
 async function setup() {
-  const URL = env("SUPABASE_URL");
-  const SVC_KEY = env("SUPABASE_SERVICE_ROLE_KEY");
-  const ANON_KEY = env("SUPABASE_ANON_KEY");
-  if (!URL || !SVC_KEY || !ANON_KEY) {
-    bail(`missing env in ${path.basename(ENV_FILE)} — need SUPABASE_URL${!URL ? " (absent)" : ""}, ` +
-      `SUPABASE_SERVICE_ROLE_KEY${!SVC_KEY ? " (absent)" : ""}, SUPABASE_ANON_KEY${!ANON_KEY ? " (absent)" : ""}`);
+  // Own the freshness: re-apply the working-tree migrations into the local stack, immediately
+  // before the isolation battery, so the proof tests the RLS files about to merge — not a
+  // stale-but-still-enforcing connected schema.
+  console.log("applying the working-tree migrations into the local stack (supabase db reset)...");
+  const reset = dbReset();
+  if (reset.error) { bail(`could not run \`supabase db reset\`: ${reset.error.message} — is the local stack up (\`supabase start\`)?`); return null; }
+  if (reset.status !== 0) { bail(`\`supabase db reset\` FAILED (exit ${reset.status}) — the working-tree migrations did not apply cleanly:\n${reset.out.split("\n").filter(Boolean).slice(-10).join("\n")}`); return null; }
+  console.log("migrations applied fresh.");
+
+  // Bind the target: source the connection from the stack the reset just targeted (same cwd →
+  // same config.toml → same instance). No env URL/key is read — no second target to diverge.
+  const st = statusJson();
+  if (st.error) { bail(`could not run \`supabase status\`: ${st.error.message} — is the local stack up (\`supabase start\`)?`); return null; }
+  if (st.status !== 0) { bail(`\`supabase status\` FAILED (exit ${st.status}) — cannot confirm the reset target:\n${(st.err || "").split("\n").filter(Boolean).slice(-6).join("\n")}`); return null; }
+  if (!st.creds || !st.creds.API_URL || !st.creds.SERVICE_ROLE_KEY || !st.creds.ANON_KEY) {
+    bail("`supabase status -o json` did not surface API_URL + SERVICE_ROLE_KEY + ANON_KEY — cannot bind the test to the reset target");
     return null;
   }
+  const URL = st.creds.API_URL;
+  const SVC_KEY = st.creds.SERVICE_ROLE_KEY;
+  const ANON_KEY = st.creds.ANON_KEY;
   if (!isLoopbackUrl(URL)) {
-    bail(`SUPABASE_URL is not loopback (${URL}) — this proof creates and deletes auth users, so it runs only against a local throwaway stack. Point ${path.basename(ENV_FILE)} at \`supabase start\`.`);
+    bail(`the reset target's API_URL is not loopback (${URL}) — this proof creates and deletes auth users, so it runs only against a local throwaway stack.`);
     return null;
   }
   const anonRole = jwtRole(ANON_KEY);
@@ -407,6 +508,17 @@ async function setup() {
   SVC = svc;
   const anon = createClient(URL, ANON_KEY, opts);
   console.log(`project ${projectRef(URL)} (local) — anon ${roleNote}`);
+
+  // The reset restarted the auth container; wait for the gateway→auth route to be live before
+  // ANY auth/DB call, so a transient post-reset 502 can't masquerade as a createUser failure.
+  // On timeout we bail to CNV (fail closed) — never run the battery against a not-ready stack.
+  console.log("waiting for auth to be ready after reset (gateway /auth/v1/health)...");
+  const authReady = await waitForAuthReady(URL);
+  if (!authReady.ready) {
+    bail(`auth not ready after reset (last: ${authReady.last}); if this persists the Kong gateway may be wedged — \`docker restart supabase_kong_resume\` and re-run.`);
+    return null;
+  }
+  console.log("auth ready.");
 
   await sweep(svc);
   await deleteTestUsers(svc);
@@ -709,6 +821,16 @@ function partB() {
   }
 }
 
+// Exit cleanly WITHOUT a forced process.exit() racing libuv handle teardown on Windows (the
+// `UV_HANDLE_CLOSING` assertion that crashed the bail path while gateway sockets were still
+// open): set the code and let the event loop drain (keep-alive sockets idle-close → clean
+// exit), with an unref'd backstop so a stuck handle can never make us hang. The exit CODES
+// are unchanged — only the mechanism.
+function gracefulExit(code) {
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 8000).unref();
+}
+
 // ── run ────────────────────────────────────────────────────────────────────────────
 {
   console.log("=== Veritas security proof — anon RLS denial + authenticated cross-user isolation (BOTH directions) + server-only build guard (LOCAL stack) ===\n");
@@ -724,8 +846,11 @@ function partB() {
     bail(`unexpected error during Part A/C: ${e.message}`);
   } finally {
     if (SVC) {
-      try { await sweep(SVC); } catch {}
-      try { await deleteTestUsers(SVC); } catch {}
+      const errs = [];
+      try { errs.push(...await sweep(SVC)); } catch (e) { errs.push(`sweep threw: ${(e.message || "").split("\n")[0]}`); }
+      try { errs.push(...await deleteTestUsers(SVC)); } catch (e) { errs.push(`deleteTestUsers threw: ${(e.message || "").split("\n")[0]}`); }
+      try { cleanupStatus = await confirmClean(SVC, errs); }
+      catch (e) { cleanupStatus = { clean: false, errors: [...errs, `confirmClean threw: ${(e.message || "").split("\n")[0]}`], leftJobs: "?", leftFacts: "?", usersPresent: "?" }; }
     }
   }
 
@@ -739,22 +864,32 @@ function partB() {
   const fails = checks.filter((c) => c.verdict === "FAIL");
   const cnvs = checks.filter((c) => c.verdict === "CNV");
 
+  if (cleanupStatus) {
+    console.log(cleanupStatus.clean
+      ? "  cleanup: stack left clean (marker rows swept, A/B test users deleted, verified)."
+      : `  CLEANUP LEAK — left jobs=${cleanupStatus.leftJobs}, facts=${cleanupStatus.leftFacts}, A/B users present=${cleanupStatus.usersPresent}${cleanupStatus.errors.length ? "; errors: " + cleanupStatus.errors.join(" | ") : ""}`);
+    console.log("");
+  }
+
+  let exitCode;
   if (fatal) {
     console.log(`✗ COULD NOT VERIFY — ${fatal}. No proof produced; this is NOT a pass.`);
-    process.exit(2);
-  }
-  if (checks.length !== EXPECTED) {
+    exitCode = 2;
+  } else if (checks.length !== EXPECTED) {
     console.log(`✗ COULD NOT VERIFY — only ${checks.length}/${EXPECTED} checks ran. No proof produced; this is NOT a pass.`);
-    process.exit(2);
-  }
-  if (fails.length) {
+    exitCode = 2;
+  } else if (fails.length) {
     console.log(`✗ REGRESSION — ${fails.length} security check(s) FAILED. A row leaked or the build guard did not hold. STOP; do not merge.`);
-    process.exit(1);
-  }
-  if (cnvs.length) {
+    exitCode = 1;
+  } else if (cnvs.length) {
     console.log(`✗ COULD NOT VERIFY — ${cnvs.length} check(s) inconclusive. No full proof produced; this is NOT a pass.`);
-    process.exit(2);
+    exitCode = 2;
+  } else if (cleanupStatus && !cleanupStatus.clean) {
+    console.log("✗ CLEANUP LEAK — every registered check passed, but the proof did not leave the stack clean (see above). NOT a pass.");
+    exitCode = 3;
+  } else {
+    console.log("✓ SECURITY PROVED — anon denied every read/insert/update/delete on all six tables; authenticated users A and B are isolated on all six tables in BOTH directions (read + write — cross-owner INSERT/give-away → 42501, cross-user UPDATE/DELETE → silent zero-row no-op — by service-role ground truth, with positive controls); the server-only client-import build guard holds attributably.");
+    exitCode = 0;
   }
-  console.log("✓ SECURITY PROVED — anon denied every read/insert/update/delete on all six tables; authenticated users A and B are isolated on all six tables in BOTH directions (read + write — cross-owner INSERT/give-away → 42501, cross-user UPDATE/DELETE → silent zero-row no-op — by service-role ground truth, with positive controls); the server-only client-import build guard holds attributably.");
-  process.exit(0);
+  gracefulExit(exitCode);
 }
