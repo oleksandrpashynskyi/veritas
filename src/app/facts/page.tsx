@@ -49,8 +49,16 @@ export default async function FactsPage({
   return (
     <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 p-8">
       <header className="flex items-center justify-between border-b border-zinc-200 pb-3">
-        <span className="text-sm text-zinc-600">Signed in as {user.email}</span>
-        <LogoutButton />
+        <nav className="flex items-center gap-4 text-sm">
+          <span className="font-medium">Profile</span>
+          <Link href="/jobs" className="text-zinc-600 underline">
+            Jobs
+          </Link>
+        </nav>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-zinc-600">{user.email}</span>
+          <LogoutButton />
+        </div>
       </header>
 
       <section className="flex flex-col gap-3">
