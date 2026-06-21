@@ -41,6 +41,8 @@ DONE (M1.5 close): verify-security.mjs now adopts the same owned-`supabase db re
 
 DEFERRED (low priority): apply the same post-reset `/auth/v1/health` readiness gate to verify.mjs (invariant smoke test) — same Kong-wedge class, low exposure (one createUser, single reset usually stays routable), already fails closed. Fold in next time verify.mjs is touched.
 
+DEFERRED (housekeeping): the Next build warns src/middleware.ts should be renamed proxy. Route protection is intact regardless (the page-level getUser() → redirect re-checks, Codex-confirmed) — this is the naming-convention question only. Understand what Next 15 is signaling and rename if appropriate. Pre-existing; predates M2.
+
 DEFERRED (fold into the full-CRUD cut, before /veritas-per-user-path is treated as a standing gate): verify-m2.mjs owes BOTH (1) an HTTP RUNTIME exercise of the real /facts routes — drive signup/login and the actual routes through the running app so the test passes through the real server client and createFact, not a stand-in — AND (2) complete REACHABLE-SURFACE coverage via transitive import-graph analysis. The current guard recursively scans the app/lib source surface (src/app + src/lib + src/middleware.ts) for service-role tokens, so it catches a service-role helper added ANYWHERE under those trees, and asserts the app's anon-key role; but it does NOT follow the transitive import graph (dynamic/computed imports, or a reach from outside the scanned trees) and is NOT a runtime exercise. Both close before /veritas-per-user-path is treated as a standing gate.
 
 Commit, small PR.
