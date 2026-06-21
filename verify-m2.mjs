@@ -14,9 +14,10 @@
 //     service-role client, or misconfiguring the app's anon key to the service-role key.
 //
 //   [db re-confirmation — a STAND-IN client, NOT the app path]
-//     Re-confirms the RLS property the app relies on (owner-stamping + per-user isolation)
-//     using a stand-in per-user client (anon key + a real session). It does NOT import or
-//     drive the app's server client / createFact, so it is NOT a proof of the app path.
+//     Re-confirms the RLS property the app relies on (owner-stamping + per-user read/write/delete
+//     isolation, plus the owner update/delete happy path) using a stand-in per-user client (anon
+//     key + a real session). It does NOT import or drive the app's server client / createFact /
+//     updateFact / deleteFact, so it is NOT a proof of the app path.
 //
 // NOT YET DONE (recorded deferral — PROMPTS.md, the CRUD cut): EXERCISE the real /facts routes
 // over HTTP through the running app, so the test passes through the actual server client and
@@ -222,6 +223,23 @@ try {
   const spoofCount = await svc.from("fact").select("*", { count: "exact", head: true }).eq("content", MARK + "_SPOOF");
   const spoofBlocked = spoof.error?.code === "42501" && spoofCount.count === 0;
   ok("[db re-confirm] a per-user client cannot spoof owner (insert as another -> 42501)", spoofBlocked, `code=${spoof.error?.code || "none"}, rows created=${spoofCount.count}`);
+
+  // delete isolation — B deleting A's fact via the stand-in client is a silent RLS no-op.
+  const del = await B.c.from("fact").delete().eq("id", factA).select("id");
+  const afterDel = await svc.from("fact").select("content").eq("id", factA).single();
+  const deleteBlocked = !del.error && (del.data?.length ?? 0) === 0 && !afterDel.error && afterDel.data?.content === MARK + "_A";
+  ok("[db re-confirm] per-user delete isolation (cross-user DELETE is a no-op)", deleteBlocked, `B delete rows=${del.data?.length ?? "?"} err=${del.error?.code || "none"}; A row still present=${!afterDel.error && afterDel.data?.content === MARK + "_A"}`);
+
+  // owner happy path — A CAN update then delete its OWN fact (what updateFact/deleteFact rely on).
+  const ownUpd = await A.c.from("fact").update({ content: MARK + "_A_EDITED" }).eq("id", factA).select("id");
+  const afterOwnUpd = await svc.from("fact").select("content").eq("id", factA).single();
+  const ownEditOk = !ownUpd.error && (ownUpd.data?.length ?? 0) === 1 && afterOwnUpd.data?.content === MARK + "_A_EDITED";
+  ok("[db re-confirm] owner can update its own fact", ownEditOk, `rows=${ownUpd.data?.length ?? "?"} err=${ownUpd.error?.code || "none"}; content updated=${afterOwnUpd.data?.content === MARK + "_A_EDITED"}`);
+
+  const ownDel = await A.c.from("fact").delete().eq("id", factA).select("id");
+  const afterOwnDel = await svc.from("fact").select("*", { count: "exact", head: true }).eq("id", factA);
+  const ownDeleteOk = !ownDel.error && (ownDel.data?.length ?? 0) === 1 && afterOwnDel.count === 0;
+  ok("[db re-confirm] owner can delete its own fact", ownDeleteOk, `rows=${ownDel.data?.length ?? "?"} err=${ownDel.error?.code || "none"}; row gone=${afterOwnDel.count === 0}`);
 } catch (e) {
   fatal = short(e);
 } finally {
