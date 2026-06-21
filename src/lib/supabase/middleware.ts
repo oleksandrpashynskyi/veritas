@@ -2,8 +2,8 @@ import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
 // Refreshes the user's session on every request (so Server Components/Actions always read a
-// fresh session) AND guards the data path: an unauthenticated request to /facts is redirected
-// to /login. Anon key + session cookies only — never the service-role key.
+// fresh session) AND guards the data path: an unauthenticated request to /facts or /jobs is
+// redirected to /login. Anon key + session cookies only — never the service-role key.
 export async function updateSession(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request });
 
@@ -34,8 +34,9 @@ export async function updateSession(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
-  // Route protection for the data path. The page + the create action re-check server-side too.
-  if (!user && request.nextUrl.pathname.startsWith("/facts")) {
+  // Route protection for the data path. The page + the actions re-check server-side too.
+  const path = request.nextUrl.pathname;
+  if (!user && (path.startsWith("/facts") || path.startsWith("/jobs"))) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     return NextResponse.redirect(url);
