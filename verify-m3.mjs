@@ -13,9 +13,10 @@
 //     (1b) KEY-ROLE: the app's NEXT_PUBLIC_SUPABASE_ANON_KEY decodes to anon / is publishable.
 //     (1c) KEY-CONTAINMENT (M3): the Anthropic key is server-only. `ANTHROPIC_API_KEY` and the
 //          `@anthropic-ai/sdk` import appear nowhere under src/ EXCEPT the sanctioned server-only
-//          module src/lib/llm/extraction.ts; and NO `NEXT_PUBLIC_ANTHROPIC*` exists anywhere under
-//          src/ or in the env files. The `import "server-only"` guard in extraction.ts is the
-//          build-time complement (not asserted here; `next build` enforces it).
+//          module src/lib/llm/client.ts (M4: the key+SDK transport extraction.ts and matching.ts
+//          both call); and NO `NEXT_PUBLIC_ANTHROPIC*` exists anywhere under src/ or in the env
+//          files. The `import "server-only"` guard in client.ts is the build-time complement (not
+//          asserted here; `next build` enforces it).
 //
 //   [db re-confirmation — a STAND-IN per-user client, NOT the app path]
 //     Re-confirms the RLS property the app relies on for job (root) + requirement (child via
@@ -105,7 +106,7 @@ function serviceRoleScan() {
 // appear ONLY in the sanctioned server-only module; no NEXT_PUBLIC_ANTHROPIC* anywhere under src/
 // or in env files. Fails closed on read error / empty scan / missing sanctioned module.
 function keyContainmentScan() {
-  const sanctioned = path.resolve(path.join(REPO, "src", "lib", "llm", "extraction.ts"));
+  const sanctioned = path.resolve(path.join(REPO, "src", "lib", "llm", "client.ts"));
   const readErrors = [];
   const files = walkTs(path.join(REPO, "src"), readErrors);
   const keyHits = [], sdkHits = [], publicHits = [];
@@ -214,15 +215,15 @@ try {
     kc.readErrors.length === 0 && kc.scanned > 0 && kc.sanctionedSeen &&
     kc.keyHits.length === 0 && kc.sdkHits.length === 0 && kc.publicHits.length === 0;
   ok(
-    "[app guard] ANTHROPIC_API_KEY + @anthropic-ai/sdk are server-only (only in src/lib/llm/extraction.ts; no NEXT_PUBLIC_ANTHROPIC*)",
+    "[app guard] ANTHROPIC_API_KEY + @anthropic-ai/sdk are server-only (only in src/lib/llm/client.ts; no NEXT_PUBLIC_ANTHROPIC*)",
     kcOk,
     kc.readErrors.length ? `READ ERROR — fail closed: ${kc.readErrors.join("; ")}`
       : kc.scanned === 0 ? "scanned 0 files — cannot verify (fail closed)"
-      : !kc.sanctionedSeen ? "sanctioned module src/lib/llm/extraction.ts not found (fail closed)"
+      : !kc.sanctionedSeen ? "sanctioned module src/lib/llm/client.ts not found (fail closed)"
       : kc.keyHits.length ? `KEY LEAK: ANTHROPIC_API_KEY in ${kc.keyHits.join(", ")}`
       : kc.sdkHits.length ? `SDK LEAK: @anthropic-ai/sdk imported in ${kc.sdkHits.join(", ")}`
       : kc.publicHits.length ? `PUBLIC VAR: NEXT_PUBLIC_ANTHROPIC* in ${kc.publicHits.join(", ")}`
-      : `clean across ${kc.scanned} files (key + SDK confined to extraction.ts; no public Anthropic var)`,
+      : `clean across ${kc.scanned} files (key + SDK confined to client.ts; no public Anthropic var)`,
   );
 
   svc = createClient(URL, SVC, { auth: { persistSession: false, autoRefreshToken: false } });
