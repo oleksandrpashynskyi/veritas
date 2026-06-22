@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { matchCoverage } from "@/lib/llm";
-import { type Coverage } from "@/lib/llm/coverage-schema";
+import { reconcileCitations, type Coverage } from "@/lib/llm/coverage-schema";
 import { persistCoverage } from "@/lib/provenance/coverage";
 import type { ViewFact, ViewRequirement } from "./coverage-view";
 
@@ -88,7 +88,25 @@ export async function computeCoverage(
   );
   if (!result.ok) return { status: "error", error: result.error };
 
-  return { status: "ready", jobId, coverage: result.value, requirements, facts };
+  // Provenance at the REVIEW surface: reconcile the matcher's citations against the user's REAL
+  // owned facts + this job's requirements — the SAME gate persistCoverage applies at save, built
+  // from the same RLS-scoped data already fetched above. The preview must show EXACTLY what Save
+  // will store, and must never present a met/partial citing a hallucinated/foreign id. Fail closed:
+  // a bad citation -> recompute, identical to save's wholesale rejection. On success the preview
+  // carries the reconciled rows (omitted requirements filled as unmet) — preview == save.
+  const reconciled = reconcileCitations({
+    entries: result.value.coverage,
+    ownedFactIds: new Set(facts.map((f) => f.id)),
+    jobRequirementIds: new Set(requirements.map((r) => r.id)),
+  });
+  if (!reconciled.ok) {
+    return {
+      status: "error",
+      error: "The match cited evidence that isn't in your profile. Please compute again.",
+    };
+  }
+
+  return { status: "ready", jobId, coverage: { coverage: reconciled.rows }, requirements, facts };
 }
 
 function parseJson(s: string): unknown {

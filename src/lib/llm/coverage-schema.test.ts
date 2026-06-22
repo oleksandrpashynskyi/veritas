@@ -260,4 +260,24 @@ describe("reconcileCitations", () => {
       expect(r.rows.every((x) => x.status === "unmet" && x.fact_ids.length === 0)).toBe(true);
     }
   });
+
+  // preview == save (Codex M4 fix 2): computeCoverage validates the matcher output then reconciles
+  // it against the facts it SUPPLIED before showing the preview — so a hallucinated (UUID-shaped but
+  // not-supplied) fact id is rejected at the review surface, exactly as persistCoverage rejects it at
+  // save. The preview must never present a met/partial whose cited facts don't all resolve to owned
+  // facts. This threads validate -> reconcile exactly as the compute -> preview path does.
+  it("preview==save: rejects matcher output citing a UUID-shaped fact id not among the supplied facts", () => {
+    const matcherOutput = {
+      coverage: [{ requirement_id: R1, status: "met", fact_ids: [FOREIGN_FACT] }],
+    };
+    const validated = validateCoverage(matcherOutput);
+    expect(validated.ok).toBe(true); // structurally fine — the bug is realness, caught next
+    if (!validated.ok) return;
+    const r = reconcileCitations({
+      entries: validated.value.coverage,
+      ownedFactIds: new Set([F1]), // the supplied facts; FOREIGN_FACT is NOT among them
+      jobRequirementIds: new Set([R1]),
+    });
+    expect(r.ok).toBe(false);
+  });
 });

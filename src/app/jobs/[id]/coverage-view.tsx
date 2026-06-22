@@ -1,63 +1,29 @@
 // Presentational coverage map — shared by the live preview (coverage-compute.tsx, client) and the
-// stored map (page.tsx, server). No "use client", no hooks, so it renders in either environment.
-// The honest-display rules live HERE so preview and stored view can never drift:
+// stored map (page.tsx, server). No "use client", no hooks, so it renders in either environment. The
+// PURE logic (buildCoverageRows / isProvisional / view types) lives in ./coverage-view-logic so it
+// is unit-testable without a DOM; this file is the JSX shell. Honest-display rules:
 //   - every requirement is shown, in order, with its status — gaps (unmet) are never hidden.
-//   - status-level confirmation (Q1): a met/partial backed ENTIRELY by unverified facts reads as
-//     "provisional" (amber, dashed), visually distinct from a verified-backed met (green/solid) —
-//     so a confident claim on unconfirmed ground is never shown as solid.
-import type { RequirementKind } from "@/lib/llm/extraction-schema";
-import type { CoverageEntry, CoverageStatus } from "@/lib/llm/coverage-schema";
-import type { FactType } from "../../facts/facts";
+//   - status-level confirmation (Q1): a met/partial with ANY unverified cited fact reads as
+//     "provisional" (amber, dashed), visually distinct from a fully-verified met (green/solid).
+import type { CoverageStatus } from "@/lib/llm/coverage-schema";
 import { KIND_LABELS } from "../jobs";
+import {
+  buildCoverageRows,
+  isProvisional,
+  type CoverageRow,
+  type ViewFact,
+  type ViewRequirement,
+} from "./coverage-view-logic";
 
-export type ViewRequirement = { id: string; text: string; kind: RequirementKind };
-export type ViewFact = {
-  id: string;
-  type: FactType;
-  content: string;
-  employer: string | null;
-  role: string | null;
-  verified: boolean;
-};
-export type CoverageRow = {
-  requirement: ViewRequirement;
-  status: CoverageStatus;
-  evidence: ViewFact[];
-};
-
-// Build one row PER requirement (in the given requirement order), resolving each requirement's
-// assessment + cited evidence by id. A requirement the matcher omitted defaults to unmet — the same
-// honest default reconcileCitations applies at save time, so the preview matches what gets stored.
-export function buildCoverageRows(
-  entries: CoverageEntry[],
-  requirements: ViewRequirement[],
-  facts: ViewFact[],
-): CoverageRow[] {
-  const factById = new Map(facts.map((f) => [f.id, f]));
-  const entryByReq = new Map(entries.map((e) => [e.requirement_id, e]));
-  return requirements.map((requirement) => {
-    const entry = entryByReq.get(requirement.id);
-    const status: CoverageStatus = entry?.status ?? "unmet";
-    const evidence = (entry?.fact_ids ?? [])
-      .map((id) => factById.get(id))
-      .filter((f): f is ViewFact => Boolean(f));
-    return { requirement, status, evidence };
-  });
-}
+// Re-export the pure logic so consumers keep importing from "./coverage-view".
+export { buildCoverageRows };
+export type { CoverageRow, ViewFact, ViewRequirement };
 
 const STATUS_SOLID: Record<CoverageStatus, string> = {
   met: "bg-green-100 text-green-700",
   partial: "bg-amber-100 text-amber-800",
   unmet: "bg-zinc-100 text-zinc-600",
 };
-
-function isProvisional(row: CoverageRow): boolean {
-  return (
-    (row.status === "met" || row.status === "partial") &&
-    row.evidence.length > 0 &&
-    row.evidence.every((f) => !f.verified)
-  );
-}
 
 export function CoverageMap({ rows }: { rows: CoverageRow[] }) {
   const counts = { met: 0, partial: 0, unmet: 0 } as Record<CoverageStatus, number>;
