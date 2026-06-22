@@ -5,7 +5,7 @@
 // (non-zero) on any violation:
 //
 //   [app guard — binds to the REAL tree]
-//     (1a) STATIC service-role scan: every .ts/.tsx under src/ (recursive) imports NO service-role
+//     (1a) STATIC service-role scan: every LOADABLE source file under src/ (recursive) imports NO service-role
 //          client (no `getDb`, no `@/lib/db`, no `SUPABASE_SERVICE_ROLE_KEY`) — excluding only the
 //          sanctioned getDb definition (src/lib/db/client.ts + index.ts). Auto-covers the new
 //          src/app/jobs/* and src/lib/llm/* files by LOCATION. Static surface scan only (no
@@ -66,7 +66,13 @@ function walkTs(dir, errors) {
   for (const e of entries) {
     const p = path.join(dir, e.name);
     if (e.isDirectory()) out.push(...walkTs(p, errors));
-    else if (/\.(ts|tsx)$/.test(e.name)) out.push(p);
+    // Codex M4 fix (low): skip declaration files (*.d.ts/*.d.mts/*.d.cts) — type-only, not
+    // executable source — BEFORE the loadable-suffix match (they end in .ts/.mts/.cts too).
+    else if (/\.d\.(ts|mts|cts)$/.test(e.name)) continue;
+    // Codex M4 fix 1: scan every LOADABLE source suffix, not just .ts/.tsx — a .mjs/.cjs/.js/.jsx/
+    // .mts/.cts file under src/ can equally read the key or import the service-role client, so a
+    // future file in any of them must not slip past the guard.
+    else if (/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(e.name)) out.push(p);
   }
   return out;
 }
