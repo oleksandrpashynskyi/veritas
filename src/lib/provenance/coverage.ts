@@ -49,8 +49,15 @@ export async function persistCoverage(
     return { ok: false, error: "No requirements found for this job." };
   }
 
-  // 4. The user's REAL owned fact ids, via the per-user client (RLS-scoped to the owner).
-  const factRes = await client.from("fact").select("id");
+  // 4. The user's REAL owned, CITABLE fact ids, via the per-user client (RLS-scoped to the owner).
+  //    `.neq("type", "writing_sample")` excludes the voice-only writing samples — they assert nothing
+  //    about experience, so they may never be cited as evidence that a requirement is met (consistent
+  //    with being uncitable by any claim line). Coverage still considers verified AND unverified facts
+  //    (the provisional-status rule lives in the view); only writing samples are barred as evidence.
+  const factRes = await client
+    .from("fact")
+    .select("id")
+    .neq("type", "writing_sample");
   if (factRes.error) return { ok: false, error: factRes.error.message };
   const ownedFactIds = new Set<string>(
     (factRes.data ?? []).map((r) => r.id as string),

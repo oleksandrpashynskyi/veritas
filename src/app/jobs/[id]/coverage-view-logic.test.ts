@@ -65,4 +65,24 @@ describe("buildCoverageRows", () => {
     expect(rows[0].status).toBe("unmet");
     expect(rows[0].evidence).toEqual([]);
   });
+
+  it("does not render a cited writing_sample as coverage evidence (dirty-row defense-in-depth)", () => {
+    // A cited id resolving to a voice-only writing sample (only possible from a dirty/out-of-band row)
+    // must render as NOTHING, like an unresolved id — so the map never shows a sample as evidence a
+    // requirement is met; the requirement's other valid evidence still shows.
+    const sample: ViewFact = {
+      id: "ws",
+      type: "writing_sample",
+      content: "my prose",
+      employer: null,
+      role: null,
+      verified: true,
+    };
+    const rows = buildCoverageRows(
+      [{ requirement_id: "r1", status: "met" as const, fact_ids: ["f1", "ws"] }],
+      [req("r1")],
+      [fact("f1", true), sample],
+    );
+    expect(rows[0].evidence.map((f) => f.id)).toEqual(["f1"]);
+  });
 });

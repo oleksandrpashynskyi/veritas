@@ -252,6 +252,10 @@ try {
   const fB = await B.c.from("fact").insert({ type: "skill", content: MARK + "_B_FACT", owner: B.id }).select("id").single();
   if (fB.error) throw new Error(`B create-fact failed: ${fB.error.message}`);
   const factB = fB.data.id;
+  // B owns a VERIFIED WRITING SAMPLE — voice-only, must NEVER be storable as coverage evidence.
+  const fBws = await B.c.from("fact").insert({ type: "writing_sample", content: MARK + "_B_WS", owner: B.id, verified: true }).select("id").single();
+  if (fBws.error) throw new Error(`B create-writing-sample failed: ${fBws.error.message}`);
+  const factBws = fBws.data.id;
 
   // A's job: reqA1 (gets coverage, for isolation) + reqA2 (clean, for the child-insert guard).
   const jA = await A.c.from("job").insert({ raw_text: MARK + "_A_JOB", company: "A Co", title: "A Role", owner: A.id }).select("id").single();
@@ -351,6 +355,15 @@ try {
   ok("[provenance] persistCoverage REJECTS a coverage citing a requirement outside the job; nothing stored", provReqOk,
     `result.ok=${provReq?.ok}; err=${short(provReq?.error || "")}; stored rows=${provReqCnt.count}`);
 
+  // (ii-b) cite a VERIFIED WRITING SAMPLE as coverage evidence -> REJECTED. Writing samples are
+  // voice-only; persistCoverage's owned set now excludes type=writing_sample, so a writing sample can
+  // never be stored as evidence that a requirement is met — the coverage map can never show it either.
+  const provWs = await persistCoverage(B.c, B.id, jobB2, { coverage: [{ requirement_id: reqB2x, status: "met", fact_ids: [factBws] }] });
+  const provWsCnt = await svc.from("coverage").select("*", { count: "exact", head: true }).eq("job_id", jobB2).eq("requirement_id", reqB2x);
+  const provWsOk = provWs?.ok === false && provWsCnt.count === 0;
+  ok("[provenance] persistCoverage REJECTS coverage citing a VERIFIED writing_sample fact (voice-only, never evidence); nothing stored", provWsOk,
+    `result.ok=${provWs?.ok}; err=${short(provWs?.error || "")}; stored rows=${provWsCnt.count}`);
+
   // (iii) positive control — cite the user's OWN fact -> STORED (proves the rejection is meaningful).
   const provPos = await persistCoverage(B.c, B.id, jobB2, { coverage: [{ requirement_id: reqB2x, status: "met", fact_ids: [factB] }] });
   const provPosCnt = await svc.from("coverage").select("*", { count: "exact", head: true }).eq("job_id", jobB2).eq("requirement_id", reqB2x);
@@ -387,7 +400,7 @@ else {
   for (const c of checks) { console.log(`  ${c.pass ? "PASS" : "FAIL"}  ${c.name} — ${c.detail}`); if (!c.pass) allPass = false; }
   if (!allPass) { console.log("\n✗ FAIL — an M4 app guard, the coverage RLS property, or the fact_id-provenance gate did not hold."); process.exitCode = 1; }
   else if (!cleanupClean) { console.log("\n✗ CLEANUP LEAK — checks passed but throwaway data/users remained."); process.exitCode = 3; }
-  else { console.log("\n✓ APP GUARDS HELD (no service-role import; anon key verified; Anthropic key server-only in client.ts) + COVERAGE RLS RE-CONFIRMED (read isolation; update + delete no-ops BOTH directions; child-via-parent insert guard) + fact_id-PROVENANCE enforced FAIL-CLOSED via the REAL persistCoverage (foreign fact + foreign requirement rejected, owned-fact stored). Pure validator proven by vitest (coverage-schema.test.ts). Stack left clean."); process.exitCode = 0; }
+  else { console.log("\n✓ APP GUARDS HELD (no service-role import; anon key verified; Anthropic key server-only in client.ts) + COVERAGE RLS RE-CONFIRMED (read isolation; update + delete no-ops BOTH directions; child-via-parent insert guard) + fact_id-PROVENANCE enforced FAIL-CLOSED via the REAL persistCoverage (foreign fact + foreign requirement + voice-only writing-sample rejected, owned-fact stored). Pure validator proven by vitest (coverage-schema.test.ts). Stack left clean."); process.exitCode = 0; }
 }
 // allow the event loop to drain (supabase-js keep-alive sockets) then exit cleanly
 setTimeout(() => process.exit(process.exitCode || 0), 3000).unref();

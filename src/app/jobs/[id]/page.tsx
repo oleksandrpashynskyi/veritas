@@ -7,6 +7,13 @@ import { CoverageCompute } from "./coverage-compute";
 import { buildCoverageRows, CoverageMap, type ViewFact } from "./coverage-view";
 import { ResumeGenerate } from "./resume-compute";
 import { ResumeView, buildResumeRows, type CitedFact } from "./resume-view";
+import { CoverLetterGenerate } from "./cover-letter-compute";
+import {
+  CoverLetterView,
+  buildCoverLetterRows,
+  type ClaimRowInput,
+  type ConnectiveRowInput,
+} from "./cover-letter-view";
 
 type JobDetail = {
   company: string | null;
@@ -85,10 +92,37 @@ export default async function JobDetailPage({
       .order("position");
     const { data: rFactData } = await supabase
       .from("fact")
-      .select("id, content, verified");
+      .select("id, content, verified, type");
     resumeRows = buildResumeRows(
       (lineData ?? []) as { text: string; fact_ids: string[] }[],
       (rFactData ?? []) as CitedFact[],
+    );
+  }
+
+  // Cover letter for this job (one per job; same tables as the résumé, type=cover_letter; RLS:
+  // grandchild via document -> job). Claim doc_lines carry the cited evidence; the connective prose
+  // rides on the document row (the `connective` JSONB column). buildCoverLetterRows merges them back
+  // into one ordered letter, the SAME logic the live preview uses. Offered only once coverage exists.
+  const { data: coverDoc } = await supabase
+    .from("document")
+    .select("id, connective")
+    .eq("job_id", id)
+    .eq("type", "cover_letter")
+    .maybeSingle();
+  let coverLetterRows = null;
+  if (coverDoc) {
+    const { data: clLineData } = await supabase
+      .from("doc_line")
+      .select("text, fact_ids, position")
+      .eq("document_id", coverDoc.id)
+      .order("position");
+    const { data: clFactData } = await supabase
+      .from("fact")
+      .select("id, content, verified, type");
+    coverLetterRows = buildCoverLetterRows(
+      (clLineData ?? []) as ClaimRowInput[],
+      ((coverDoc.connective ?? []) as ConnectiveRowInput[]),
+      (clFactData ?? []) as CitedFact[],
     );
   }
 
@@ -155,6 +189,19 @@ export default async function JobDetailPage({
         ) : (
           <p className="text-sm text-zinc-500">
             Compute the coverage map above first — your résumé is tailored to it.
+          </p>
+        )}
+      </section>
+
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-semibold">Cover letter</h2>
+        {coverLetterRows ? (
+          <CoverLetterView jobId={id} rows={coverLetterRows} />
+        ) : coverageRows ? (
+          <CoverLetterGenerate jobId={id} />
+        ) : (
+          <p className="text-sm text-zinc-500">
+            Compute the coverage map above first — your cover letter is tailored to it.
           </p>
         )}
       </section>

@@ -60,25 +60,44 @@ export const RESUME_SCHEMA = {
   },
 };
 
-function isPlainObject(v: unknown): v is Record<string, unknown> {
+// Shared by validateResume here and validateCoverLetter (cover-letter-schema.ts) — one home for the
+// "is this a plain object?" guard, so the two validators can never disagree on shape.
+export function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-// Validate an UNKNOWN value (parsed generator JSON, or a client-submitted accepted-subset) into a
-// clean Resume. Rejects the WHOLE thing on any malformed/off-shape/uncited/banned-word part — never
-// returns partial structure. Normalizes on success (trims text, de-dupes fact_ids, drops unexpected
-// line properties). An empty `lines` array is structurally valid here; refusing to store an empty
-// document is persistResume's business rule, not the pure validator's.
-export function validateResume(raw: unknown): ResumeResult {
-  if (!isPlainObject(raw)) {
-    return { ok: false, error: "resume payload is not an object" };
-  }
-  const list = raw.lines;
+// Per-claim-line caps + label. Defaults preserve the résumé behaviour exactly; the cover-letter
+// validator (cover-letter-schema.ts) passes its own caps/noun so the SAME cited-check + banned-word +
+// UUID + dedup logic runs on a letter's claim blocks — one code path for the structural invariant,
+// the same single-enforcement-site reasoning behind the shared persistDocument gate.
+export type ClaimLineCaps = {
+  maxLines?: number;
+  maxFactIdsPerLine?: number;
+  noun?: string;
+};
+
+export type ClaimLinesResult =
+  | { ok: true; lines: ResumeLine[] }
+  | { ok: false; error: string };
+
+// Validate an UNKNOWN list into clean, cited claim lines. Rejects the WHOLE list on any
+// malformed/off-shape/uncited/banned-word part — never partial. Normalizes on success (trims text,
+// de-dupes fact_ids, drops unexpected properties such as a cover-letter block's `kind`/`role`). An
+// empty list is structurally valid here; refusing the empty document is the gate's business rule.
+// This is the structural half of the provenance invariant shared by résumé and cover-letter claims.
+export function validateClaimLines(
+  list: unknown,
+  caps: ClaimLineCaps = {},
+): ClaimLinesResult {
+  const maxLines = caps.maxLines ?? MAX_LINES;
+  const maxFactIds = caps.maxFactIdsPerLine ?? MAX_FACT_IDS_PER_LINE;
+  const noun = caps.noun ?? "resume";
+
   if (!Array.isArray(list)) {
     return { ok: false, error: "lines must be an array" };
   }
-  if (list.length > MAX_LINES) {
-    return { ok: false, error: `too many resume lines (> ${MAX_LINES})` };
+  if (list.length > maxLines) {
+    return { ok: false, error: `too many ${noun} lines (> ${maxLines})` };
   }
 
   const lines: ResumeLine[] = [];
@@ -103,8 +122,8 @@ export function validateResume(raw: unknown): ResumeResult {
     if (e.fact_ids.length === 0) {
       return { ok: false, error: `line ${i} cites no facts` };
     }
-    if (e.fact_ids.length > MAX_FACT_IDS_PER_LINE) {
-      return { ok: false, error: `line ${i} cites too many facts (> ${MAX_FACT_IDS_PER_LINE})` };
+    if (e.fact_ids.length > maxFactIds) {
+      return { ok: false, error: `line ${i} cites too many facts (> ${maxFactIds})` };
     }
 
     const factIds: string[] = [];
@@ -129,7 +148,20 @@ export function validateResume(raw: unknown): ResumeResult {
     lines.push({ text, fact_ids: factIds });
   }
 
-  return { ok: true, value: { lines } };
+  return { ok: true, lines };
+}
+
+// Validate an UNKNOWN value (parsed generator JSON, or a client-submitted accepted-subset) into a
+// clean Resume. Thin wrapper over validateClaimLines — confirms the `{ lines: [...] }` envelope, then
+// delegates the per-line structural + banned-word checks. Behaviour is identical to before the
+// shared-validator extraction (proven by resume-schema.test.ts).
+export function validateResume(raw: unknown): ResumeResult {
+  if (!isPlainObject(raw)) {
+    return { ok: false, error: "resume payload is not an object" };
+  }
+  const res = validateClaimLines(raw.lines, { noun: "resume" });
+  if (!res.ok) return res;
+  return { ok: true, value: { lines: res.lines } };
 }
 
 // The provenance reconciler. `verifiedOwnedFactIds` is the user's REAL data, fetched by the caller

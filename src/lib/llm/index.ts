@@ -5,3 +5,4 @@
 export { extractRequirements } from "./extraction";
 export { matchCoverage } from "./matching";
 export { generateResume } from "./generation";
+export { generateCoverLetter } from "./cover-letter-generation";
