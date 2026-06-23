@@ -54,9 +54,14 @@ export async function computeCoverage(
     return { status: "error", error: "This job has no requirements to assess." };
   }
 
+  // Writing samples are voice-only — they assert nothing about experience, so they are never offered as
+  // candidate evidence for a requirement (the same exclusion persistCoverage enforces at save, so the
+  // previewed map matches what's stored, and the map can never show a writing sample as evidence that a
+  // requirement is met). Coverage still considers verified AND unverified facts (the provisional rule).
   const factRes = await supabase
     .from("fact")
     .select("id, type, content, employer, role, verified")
+    .neq("type", "writing_sample")
     .order("created_at", { ascending: false });
   if (factRes.error) return { status: "error", error: factRes.error.message };
   const facts = (factRes.data ?? []) as ViewFact[];
