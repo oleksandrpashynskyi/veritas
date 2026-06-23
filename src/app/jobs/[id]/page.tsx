@@ -5,6 +5,8 @@ import { type CoverageEntry } from "@/lib/llm/coverage-schema";
 import { REQUIREMENT_KINDS, KIND_LABELS, type RequirementRow } from "../jobs";
 import { CoverageCompute } from "./coverage-compute";
 import { buildCoverageRows, CoverageMap, type ViewFact } from "./coverage-view";
+import { ResumeGenerate } from "./resume-compute";
+import { ResumeView, buildResumeRows, type CitedFact } from "./resume-view";
 
 type JobDetail = {
   company: string | null;
@@ -65,6 +67,31 @@ export default async function JobDetailPage({
     );
   }
 
+  // Résumé for this job (one per job; RLS: grandchild via document -> job). When present we render it;
+  // the facts resolve cited fact_ids -> evidence content + verified badge. Generation is offered
+  // (below) only once coverage exists, so the model has a tailoring signal to work from.
+  const { data: resumeDoc } = await supabase
+    .from("document")
+    .select("id")
+    .eq("job_id", id)
+    .eq("type", "resume")
+    .maybeSingle();
+  let resumeRows = null;
+  if (resumeDoc) {
+    const { data: lineData } = await supabase
+      .from("doc_line")
+      .select("text, fact_ids, position")
+      .eq("document_id", resumeDoc.id)
+      .order("position");
+    const { data: rFactData } = await supabase
+      .from("fact")
+      .select("id, content, verified");
+    resumeRows = buildResumeRows(
+      (lineData ?? []) as { text: string; fact_ids: string[] }[],
+      (rFactData ?? []) as CitedFact[],
+    );
+  }
+
   return (
     <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 p-8">
       <header className="flex items-center justify-between border-b border-zinc-200 pb-3">
@@ -75,6 +102,12 @@ export default async function JobDetailPage({
       </header>
 
       <p className="text-sm text-zinc-500">{job.company ?? "Unknown company"}</p>
+
+      {pageError && (
+        <p role="alert" className="text-sm text-red-600">
+          {pageError}
+        </p>
+      )}
 
       <section className="flex flex-col gap-4">
         <h2 className="text-lg font-semibold">Requirements ({requirements.length})</h2>
@@ -106,15 +139,23 @@ export default async function JobDetailPage({
 
       <section className="flex flex-col gap-4">
         <h2 className="text-lg font-semibold">Coverage</h2>
-        {pageError && (
-          <p role="alert" className="text-sm text-red-600">
-            {pageError}
-          </p>
-        )}
         {coverageRows ? (
           <CoverageMap rows={coverageRows} />
         ) : (
           <CoverageCompute jobId={id} />
+        )}
+      </section>
+
+      <section className="flex flex-col gap-4">
+        <h2 className="text-lg font-semibold">Résumé</h2>
+        {resumeRows ? (
+          <ResumeView jobId={id} rows={resumeRows} />
+        ) : coverageRows ? (
+          <ResumeGenerate jobId={id} />
+        ) : (
+          <p className="text-sm text-zinc-500">
+            Compute the coverage map above first — your résumé is tailored to it.
+          </p>
         )}
       </section>
 

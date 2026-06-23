@@ -1,19 +1,23 @@
 /**
- * Corporate-cliché words and phrases that fail validation.
+ * Corporate-cliché vocabulary, split into two tiers.
  *
- * PROJECT_PLAN §2 "No resume soup": output is generated in the user's voice, and
- * the homogenised buzzword vocabulary that makes every AI resume sound identical
- * is rejected at the validation layer — not asked-against in a prompt.
+ * PROJECT_PLAN §2 "No resume soup": the homogenised buzzword vocabulary that makes every AI resume
+ * sound identical is rejected at the validation layer — not asked-against in a prompt. BUT (AGENTS.md):
+ * "The banned-words list must never reject a truthful, sourced line. Ambiguous words (those with
+ * legitimate technical meaning, e.g. 'dynamic') should warn, not hard-block — refusing to forbid the
+ * truth takes priority over catching every cliché." So the list is two tiers:
  *
- * Entries are lowercase. Multi-word entries match across either spaces or hyphens
- * ("game changer" also catches "game-changer"). Matching is whole-word — a banned
- * entry never trips inside a longer word ("wizard" does not match "wizardry").
- * Inflections are listed explicitly rather than stemmed; the common action-verb
- * forms (leverage/leveraging/leverages, utilize/utilizing/utilizes,
- * spearhead/spearheading/spearheads) are all included so obvious variants of a
- * banned root don't slip through.
+ *   HARD_BLOCKED_WORDS — unambiguous résumé fluff. A match is a FATAL validation rejection
+ *                        (validateResume rejects the line). findBannedWords() reports these.
+ *   WARN_WORDS         — words with a legitimate technical meaning ("dynamic programming", a setup
+ *                        "wizard"). ADVISORY only — never fatal, so a truthful sourced line is never
+ *                        rejected for using one. findWarnWords() reports these (for optional UI surfacing).
+ *
+ * Entries are lowercase. Multi-word entries match across either spaces or hyphens ("game changer" also
+ * catches "game-changer"). Matching is whole-word — a banned entry never trips inside a longer word
+ * ("wizard" does not match "wizardry"). Inflections are listed explicitly rather than stemmed.
  */
-export const BANNED_WORDS: readonly string[] = [
+export const HARD_BLOCKED_WORDS: readonly string[] = [
   "spearheaded",
   "spearheading",
   "spearheads",
@@ -32,12 +36,10 @@ export const BANNED_WORDS: readonly string[] = [
   "team player",
   "thought leader",
   "proven track record",
-  "dynamic",
   "passionate",
   "guru",
   "ninja",
   "rockstar",
-  "wizard",
   "visionary",
   "game changer",
   "cutting edge",
@@ -54,6 +56,10 @@ export const BANNED_WORDS: readonly string[] = [
   "impactful",
 ] as const;
 
+// Ambiguous technical words — a legitimate, truthful résumé line can contain these ("dynamic
+// programming optimization", "built a configuration wizard"). Advisory only; never a fatal rejection.
+export const WARN_WORDS: readonly string[] = ["dynamic", "wizard"] as const;
+
 function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -68,16 +74,30 @@ function toPattern(phrase: string): RegExp {
   return new RegExp(`(?<![\\w-])${parts.join("[\\s-]+")}(?![\\w-])`, "i");
 }
 
-const PATTERNS: ReadonlyArray<readonly [string, RegExp]> = BANNED_WORDS.map(
+const HARD_PATTERNS: ReadonlyArray<readonly [string, RegExp]> =
+  HARD_BLOCKED_WORDS.map((word) => [word, toPattern(word)] as const);
+
+const WARN_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = WARN_WORDS.map(
   (word) => [word, toPattern(word)] as const,
 );
 
 /**
- * Returns the banned entries found in `text`, deduplicated and in list order.
- * An empty array means the text is clean.
+ * Returns the HARD-BLOCKED entries found in `text`, deduplicated and in list order. A non-empty
+ * result is a FATAL validation rejection. An empty array means the text is clean of hard-blocked fluff.
  */
 export function findBannedWords(text: string): string[] {
-  return PATTERNS.filter(([, pattern]) => pattern.test(text)).map(
+  return HARD_PATTERNS.filter(([, pattern]) => pattern.test(text)).map(
+    ([word]) => word,
+  );
+}
+
+/**
+ * Returns the WARN-only (ambiguous technical) entries found in `text`. ADVISORY only — never a
+ * validation rejection. Surfaced so the user can judge; refusing to forbid the truth beats catching
+ * every cliché.
+ */
+export function findWarnWords(text: string): string[] {
+  return WARN_PATTERNS.filter(([, pattern]) => pattern.test(text)).map(
     ([word]) => word,
   );
 }

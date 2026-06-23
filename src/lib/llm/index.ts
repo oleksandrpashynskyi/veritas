@@ -4,3 +4,4 @@
 // "@/lib/llm/coverage-schema" directly, never from here.
 export { extractRequirements } from "./extraction";
 export { matchCoverage } from "./matching";
+export { generateResume } from "./generation";
