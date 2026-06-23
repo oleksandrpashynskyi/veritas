@@ -131,8 +131,17 @@ describe("validateResume", () => {
   });
 
   it("accepts a clean line whose text only resembles a banned word (whole-word boundary)", () => {
-    // "wizardry" must not trip the banned entry "wizard" — the line is truthful and sourced.
+    // "wizardry" must not trip a banned entry — the line is truthful and sourced.
     const r = validateResume({ lines: [{ text: "Practised SQL wizardry", fact_ids: [F1] }] });
+    expect(r.ok).toBe(true);
+  });
+
+  it("accepts a line with an ambiguous technical word (dynamic) — warn-only, not hard-blocked", () => {
+    // AGENTS.md / Codex FIX 4: words with legitimate technical meaning warn, they do not reject a
+    // truthful, sourced line. "dynamic programming" must pass validation.
+    const r = validateResume({
+      lines: [{ text: "Built a dynamic programming optimizer", fact_ids: [F1] }],
+    });
     expect(r.ok).toBe(true);
   });
 

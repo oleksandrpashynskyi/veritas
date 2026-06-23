@@ -390,6 +390,18 @@ try {
   ok("[db] cross-user doc_line insert onto another's document is rejected (two-hop EXISTS -> 42501)", childLineBlocked,
     `code=${childLine.error?.code || "none"}; doc_lines on A's document=${childLineCnt.count} (expect 1)`);
 
+  // ── [db] one-document-per-(job,type) UNIQUE constraint (Codex FIX 2) ──────────────────
+  // The ATOMIC backstop behind persistResume's one-résumé pre-check: a duplicate (job_id, type)
+  // insert must fail with 23505. B already owns a résumé document on jobB, so a second résumé
+  // document there is the duplicate. This is the 23505 a save-race would hit; persistResume maps it
+  // to the same "a résumé already exists" guard error (the sequential second-save below is caught
+  // earlier by the pre-check — the friendly path).
+  const dupDoc = await B.c.from("document").insert({ job_id: jobB, type: "resume", status: "draft" }).select("id");
+  const dupDocCnt = await svc.from("document").select("*", { count: "exact", head: true }).eq("job_id", jobB).eq("type", "resume");
+  const dupDocBlocked = dupDoc.error?.code === "23505" && dupDocCnt.count === 1;
+  ok("[db] a second résumé document on a job is rejected atomically (UNIQUE(job_id,type) -> 23505)", dupDocBlocked,
+    `code=${dupDoc.error?.code || "none"}; résumé docs on B's job=${dupDocCnt.count} (expect 1)`);
+
   // ── [provenance] the REAL persistResume, called with B's actual per-user client ──────
   // Helper: how many résumé documents exist on jobB2 (per service-role ground truth).
   const resumeDocs = async () => (await svc.from("document").select("id").eq("job_id", jobB2).eq("type", "resume")).data ?? [];
@@ -417,6 +429,13 @@ try {
   const provEmptyOk = provEmpty?.ok === false && (await resumeDocs()).length === 0;
   ok("[provenance] persistResume REJECTS an empty-lines payload (no empty document); nothing stored", provEmptyOk,
     `result.ok=${provEmpty?.ok}; err=${short(provEmpty?.error || "")}; résumé docs on job=${(await resumeDocs()).length}`);
+
+  // (iv-b) a LINE with EMPTY fact_ids — the cited-check, distinct from (iv)'s empty document (Codex
+  // FIX 3). Drives the REAL core: validateResume rejects the uncited line; nothing stored.
+  const provUncited = await persistResume(B.c, B.id, jobB2, { lines: [{ text: "Did real work here", fact_ids: [] }] });
+  const provUncitedOk = provUncited?.ok === false && (await resumeDocs()).length === 0;
+  ok("[provenance] persistResume REJECTS a line with empty fact_ids (the cited-check); nothing stored", provUncitedOk,
+    `result.ok=${provUncited?.ok}; err=${short(provUncited?.error || "")}; résumé docs on job=${(await resumeDocs()).length}`);
 
   // (v) BANNED word in a line citing a valid, verified, owned fact -> REJECTED by the banned gate.
   const provBanned = await persistResume(B.c, B.id, jobB2, { lines: [{ text: "Spearheaded the migration", fact_ids: [factBv] }] });
@@ -470,7 +489,7 @@ else {
   for (const c of checks) { console.log(`  ${c.pass ? "PASS" : "FAIL"}  ${c.name} — ${c.detail}`); if (!c.pass) allPass = false; }
   if (!allPass) { console.log("\n✗ FAIL — an M5 app guard, a document/doc_line RLS property, or the verified+owned provenance gate did not hold."); process.exitCode = 1; }
   else if (!cleanupClean) { console.log("\n✗ CLEANUP LEAK — checks passed but throwaway data/users remained."); process.exitCode = 3; }
-  else { console.log("\n✓ APP GUARDS HELD (no service-role import; anon key verified; Anthropic key server-only in client.ts) + DOCUMENT & DOC_LINE RLS RE-CONFIRMED (read isolation; update + delete no-ops BOTH directions; child-via-parent insert guard; re-parent owner-spoof) + VERIFIED+OWNED PROVENANCE enforced FAIL-CLOSED via the REAL persistResume (unverified + foreign + nonexistent fact rejected, empty-lines + banned-word rejected, own-verified-fact stored, second résumé rejected). Pure validator proven by vitest (resume-schema.test.ts). Stack left clean."); process.exitCode = 0; }
+  else { console.log("\n✓ APP GUARDS HELD (no service-role import; anon key verified; Anthropic key server-only in client.ts) + DOCUMENT & DOC_LINE RLS RE-CONFIRMED (read isolation; update + delete no-ops BOTH directions; child-via-parent insert guard; re-parent owner-spoof; one-document-per-(job,type) UNIQUE -> 23505) + VERIFIED+OWNED PROVENANCE enforced FAIL-CLOSED via the REAL persistResume (unverified + foreign + nonexistent fact rejected, empty-lines + uncited-line + banned-word rejected, own-verified-fact stored, second résumé rejected). Pure validator proven by vitest (resume-schema.test.ts). Stack left clean."); process.exitCode = 0; }
 }
 // allow the event loop to drain (supabase-js keep-alive sockets) then exit cleanly
 setTimeout(() => process.exit(process.exitCode || 0), 3000).unref();

@@ -3,7 +3,7 @@
 // fail-closed validation. It is server-only by transitivity (./client imports "server-only"); shared
 // code must import the pure validator/types from "@/lib/llm/resume-schema" instead, never this file.
 import { runStructured } from "./client";
-import { BANNED_WORDS } from "../provenance/banned";
+import { HARD_BLOCKED_WORDS } from "../provenance/banned";
 import {
   RESUME_SCHEMA,
   validateResume,
@@ -54,11 +54,12 @@ Produce a flat list of résumé bullet lines. For EACH line return:
 - "fact_ids": the id(s) of the fact(s) this line is derived from. Cite ONLY ids that appear in the provided facts. Every line MUST cite at least one fact id.
 
 Honesty rules — follow them strictly; this product exists so a résumé CANNOT lie:
-- You may rephrase, condense, combine, and select facts. You may NOT introduce any claim — a number, metric, percentage, amount, team size, scope, job title, employer, date, or outcome — that is not already stated, verbatim or by clear paraphrase, in the cited facts. If a detail is not in the facts, it does not go in the line.
+- REPHRASE ONLY WHAT THE FACT STATES. You may shorten, reword, and select. You may NOT add any action, responsibility, role, seniority, scope, collaboration, coordination, leadership, motivation, outcome, metric, number, or qualifier that the fact does not explicitly state. Example: from "worked in a team of 20 to deliver a product" you may say the candidate worked in a team of 20 and helped deliver a product — you may NOT say "coordinated across the team", "led", "drove shared goals", or any role or action the fact does not state.
+- Use a number, metric, percentage, amount, team size, job title, or employer ONLY if the cited fact provides it. Mention a date or timeframe ONLY when the fact supplies date_start/date_end; never invent or infer a timeframe.
 - A line may combine multiple facts only if it stays faithful to ALL of them and adds nothing beyond them.
 - If a requirement cannot be supported by the facts, OMIT it. Do not invent support. An honest gap is correct; a fabricated or inflated line is a catastrophic failure of the product.
-- Prefer fewer, well-supported lines over many thin ones. Do not pad.
-- Write plainly. Do NOT use these words or phrases: ${BANNED_WORDS.join(", ")}. Avoid generic résumé clichés in general.`;
+- Prefer fewer, well-supported lines over many thin ones. Do not pad, and do not embellish with adjectives the fact does not support.
+- Write plainly. Do NOT use these words or phrases: ${HARD_BLOCKED_WORDS.join(", ")}. Avoid generic résumé clichés in general.`;
 
 // One billed generation: verified facts + targeted coverage -> Sonnet (Structured Outputs) -> parse
 // -> fail-closed validate (cited-check, banned words, UUID-shaped ids, caps). Returns the SAME shape

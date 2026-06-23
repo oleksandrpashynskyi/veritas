@@ -92,7 +92,15 @@ export async function persistResume(
     .insert({ job_id: jobId, type: "resume", status: "approved" })
     .select("id")
     .single();
-  if (docIns.error) return { ok: false, error: docIns.error.message };
+  if (docIns.error) {
+    // 23505 = the UNIQUE(job_id, type) constraint (document_one_per_job_type). The step-5 pre-check
+    // is the friendly path; this is the atomic backstop for a race where a concurrent save created
+    // the résumé after our pre-check. Same guard outcome — nothing stored.
+    if (docIns.error.code === "23505") {
+      return { ok: false, error: "A résumé already exists for this job." };
+    }
+    return { ok: false, error: docIns.error.message };
+  }
   const documentId = docIns.data.id as string;
 
   // 9. Insert ALL lines in one statement (atomic). approved=true; position preserves the order the
@@ -108,8 +116,18 @@ export async function persistResume(
   const lineIns = await client.from("doc_line").insert(rows);
   if (lineIns.error) {
     // Compensating delete: the line insert failed (a race or corruption — the in-app gate already
-    // passed), so remove the now-childless document. Cascade clears any partial state. Store nothing.
-    await client.from("document").delete().eq("id", documentId);
+    // passed), so remove the now-childless document. Cascade clears any partial state.
+    const cleanup = await client.from("document").delete().eq("id", documentId);
+    if (cleanup.error) {
+      // The cleanup ALSO failed: do NOT swallow it. An orphaned empty approved document would
+      // silently block regeneration (the one-résumé guard would find it). Surface a distinct,
+      // diagnosable error naming the orphan so it is loud and recoverable — deleting the résumé for
+      // this job (the existing Delete action) clears it.
+      return {
+        ok: false,
+        error: `Résumé lines failed to save (${lineIns.error.message}); cleanup of the empty document ${documentId} also failed (${cleanup.error.message}). Delete the résumé for this job, then try again.`,
+      };
+    }
     return { ok: false, error: lineIns.error.message };
   }
 

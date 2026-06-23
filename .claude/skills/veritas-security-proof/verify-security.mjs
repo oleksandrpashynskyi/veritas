@@ -334,8 +334,9 @@ async function gtCntEq(svc, table, col, val) {
 
 // ── filesystem cleanup (sync, safe to call from signal handlers) ───────────────────
 function cleanupProbeSync() {
-  try { rmSync(PROBE_DIR, { recursive: true, force: true }); } catch {}
-  try { rmSync(NEXT_DIR, { recursive: true, force: true }); } catch {}
+  // Retry transient locks (Windows .next/probe-dir ENOTEMPTY); each is already non-fatal (caught).
+  try { rmSync(PROBE_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {}
+  try { rmSync(NEXT_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {}
 }
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => { cleanupProbeSync(); process.exit(2); });
@@ -439,8 +440,10 @@ async function seedRows(svc, owner) {
   ids.requirement = [(await ins("requirement", { job_id: J, text: MARK, kind: "must" }, "id")).id,
                      (await ins("requirement", { job_id: J, text: MARK, kind: "nice" }, "id")).id,
                      (await ins("requirement", { job_id: J, text: MARK, kind: "keyword" }, "id")).id];
+  // One document per (job, type): the UNIQUE(job_id, type) constraint (M5) forbids two résumés on
+  // one job, so the second probe document lives on the other seeded job (ids.job[1]).
   ids.document = [(await ins("document", { job_id: J, type: "resume" }, "id")).id,
-                  (await ins("document", { job_id: J, type: "resume" }, "id")).id];
+                  (await ins("document", { job_id: ids.job[1], type: "resume" }, "id")).id];
   await ins("coverage", { job_id: J, requirement_id: ids.requirement[0], status: "met", fact_ids: [ids.fact[0]] }, "job_id");
   await ins("coverage", { job_id: J, requirement_id: ids.requirement[1], status: "met", fact_ids: [ids.fact[0]] }, "job_id");
   ids.coverage = [{ job_id: J, requirement_id: ids.requirement[0] }, { job_id: J, requirement_id: ids.requirement[1] }];
@@ -685,6 +688,50 @@ async function childBattery(svc, table, cfg, tag, atk, atkId, vic, vicId) {
     recordPositiveDelete(L("del-own"), b, a, res, table); }
 }
 
+// ONE-HOP CHILD WITH A UNIQUE(job_id, type) CONSTRAINT (document): like childBattery, but at most
+// ONE document per (job, type), so each probe document gets its OWN home job instead of sharing one.
+// Produces the SAME 8 checks/labels as childBattery would for `document` (read-iso, ins-as-other,
+// ins-own, give-away, upd-other, upd-own, del-other, del-own) — only the seeding differs, so the
+// registered-check tally is unchanged.
+async function documentBattery(svc, tag, atk, atkId, vic, vicId) {
+  const mkJob = async (owner, m) => (await insSvc(svc, "job", { raw_text: MARK + `_${tag}_doc_${m}`, owner })).id;
+  const mkDoc = async (jobId) => (await insSvc(svc, "document", { job_id: jobId, type: "resume" })).id;
+  // attacker: one résumé per job (read/give/upd/del), plus a clean job to insert its OWN doc into.
+  const aRead = await mkDoc(await mkJob(atkId, "aRead"));
+  const aGive = await mkDoc(await mkJob(atkId, "aGive"));
+  const aUpd = await mkDoc(await mkJob(atkId, "aUpd"));
+  const aDel = await mkDoc(await mkJob(atkId, "aDel"));
+  const aInsJob = await mkJob(atkId, "aIns"); // clean — attacker inserts its own doc here (ins-own)
+  // victim: one résumé per job (read/upd/del), plus a clean job the attacker targets (denied) — reused
+  // for both ins-as-other and give-away, which both leave it clean (both are denied).
+  const vRead = await mkDoc(await mkJob(vicId, "vRead"));
+  const vUpd = await mkDoc(await mkJob(vicId, "vUpd"));
+  const vDel = await mkDoc(await mkJob(vicId, "vDel"));
+  const vCleanJob = await mkJob(vicId, "vClean");
+  const L = (op) => `document ${tag} ${op}`;
+  await checkReadIso(atk, "document", L("read-iso"), [aRead], [vRead]);
+  { const b = await gtCntEq(svc, "document", "job_id", vCleanJob);
+    const res = await atk.from("document").insert({ job_id: vCleanJob, type: "resume" }).select("id"); const a = await gtCntEq(svc, "document", "job_id", vCleanJob);
+    recordHardDeny(L("ins-as-other"), b, a, res, "42501", "a document under the victim's job"); }
+  { const b = await gtCntEq(svc, "document", "job_id", aInsJob);
+    const res = await atk.from("document").insert({ job_id: aInsJob, type: "resume" }).select("id"); const a = await gtCntEq(svc, "document", "job_id", aInsJob);
+    recordPositiveAppear(L("ins-own"), b, a, res, "a document under its own job"); }
+  { const b = await gtCol(svc, "document", aGive, "job_id");
+    const res = await atk.from("document").update({ job_id: vCleanJob }).eq("id", aGive).select("id"); const a = await gtCol(svc, "document", aGive, "job_id");
+    recordHardDeny(L("give-away"), b, a, res, "42501", "document.job_id"); }
+  { const b = await gtCol(svc, "document", vUpd, "status");
+    const res = await atk.from("document").update({ status: "approved" }).eq("id", vUpd).select("id"); const a = await gtCol(svc, "document", vUpd, "status");
+    recordNoopUpdate(L("upd-other"), b, a, res, "victim's document.status"); }
+  { const res = await atk.from("document").update({ status: "approved" }).eq("id", aUpd).select("id"); const a = await gtCol(svc, "document", aUpd, "status");
+    recordPositiveChange(L("upd-own"), a, JSON.stringify("approved"), res, "document.status"); }
+  { const b = await gtExists(svc, "document", vDel);
+    const res = await atk.from("document").delete().eq("id", vDel).select("id"); const a = await gtExists(svc, "document", vDel);
+    recordNoopDelete(L("del-other"), b, a, res, "victim's document"); }
+  { const b = await gtExists(svc, "document", aDel);
+    const res = await atk.from("document").delete().eq("id", aDel).select("id"); const a = await gtExists(svc, "document", aDel);
+    recordPositiveDelete(L("del-own"), b, a, res, "document"); }
+}
+
 // TWO-HOP CHILD (doc_line): ownership inherited via document -> job. Each role gets a
 // home job, a home document, and a citable fact (so the SECURITY INVOKER fact-existence
 // trigger passes on its OWN fact and the doc_line RLS WITH CHECK is what denies).
@@ -774,13 +821,12 @@ async function partC(ctx) {
   const factCfg = { mkRow: (o, m) => ({ type: "skill", content: m, owner: o }), mutCol: "role", markerCol: "content" };
   const jobCfg = { mkRow: (o, m) => ({ raw_text: m, owner: o }), mutCol: "company", markerCol: "raw_text" };
   const reqCfg = { mkRow: (j, m) => ({ job_id: j, text: m, kind: "must" }), mutCol: "kind", mutVal: "keyword" };
-  const docCfg = { mkRow: (j, m) => ({ job_id: j, type: "resume" }), mutCol: "status", mutVal: "approved" };
   const dirs = [["A>B", userA, idA, userB, idB], ["B>A", userB, idB, userA, idA]];
   for (const [tag, atk, atkId, vic, vicId] of dirs) {
     await rootBattery(svc, "fact", factCfg, tag, atk, atkId, vic, vicId);
     await rootBattery(svc, "job", jobCfg, tag, atk, atkId, vic, vicId);
     await childBattery(svc, "requirement", reqCfg, tag, atk, atkId, vic, vicId);
-    await childBattery(svc, "document", docCfg, tag, atk, atkId, vic, vicId);
+    await documentBattery(svc, tag, atk, atkId, vic, vicId);
     await docLineBattery(svc, tag, atk, atkId, vic, vicId);
     await coverageBattery(svc, tag, atk, atkId, vic, vicId);
   }
@@ -788,7 +834,9 @@ async function partC(ctx) {
 
 // ── Part B: server-only build guard (attributable) ─────────────────────────────────
 function buildOnce() {
-  rmSync(NEXT_DIR, { recursive: true, force: true });
+  // Hardened removal: a transient Windows file-lock on .next (ENOTEMPTY) is RETRIED rather than
+  // thrown, so a back-to-back run does not crash the build guard before it can report its verdict.
+  rmSync(NEXT_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   const res = spawnSync(process.execPath, [NEXT_BIN, "build"], {
     cwd: REPO, encoding: "utf8", maxBuffer: 128 * 1024 * 1024, env: process.env,
   });
@@ -796,8 +844,12 @@ function buildOnce() {
 }
 
 function partB() {
-  if (existsSync(PROBE_DIR)) cleanupProbeSync();
+  // The whole body is guarded: a filesystem/build fault (e.g. a Windows .next lock that survives the
+  // rmSync retries in buildOnce) must NOT throw out of here — partB runs OUTSIDE the main try/catch,
+  // so an escaping throw would crash before the tally + cleanup reporting. Exactly one "build guard"
+  // check is recorded on every path (it is 1 of the EXPECTED 121), so the tally guard stays intact.
   try {
+    if (existsSync(PROBE_DIR)) cleanupProbeSync();
     const base = buildOnce();
     if (base.error) { record("build guard", "CNV", `next could not run (baseline): ${base.error.message}`); return; }
     if (base.status !== 0) { record("build guard", "CNV", `baseline build (no probe) FAILED (exit ${base.status}) — app not green; cannot attribute the guard failure`); return; }
@@ -816,6 +868,10 @@ function partB() {
     } else {
       record("build guard", "CNV", `probe build failed (exit ${probe.status}) but NOT attributable to our probe importing client.ts — unrelated breakage, not proof`);
     }
+  } catch (e) {
+    // Degrade to a clean CNV (could-not-verify — NON-PASSING, never a false pass), then let the
+    // normal tally + cleanup decide the exit. Never a crash.
+    record("build guard", "CNV", `build guard could not run (filesystem/build fault): ${(e.message || String(e)).split("\n")[0]}`);
   } finally {
     cleanupProbeSync();
   }
