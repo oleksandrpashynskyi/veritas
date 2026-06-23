@@ -92,7 +92,7 @@ export default async function JobDetailPage({
       .order("position");
     const { data: rFactData } = await supabase
       .from("fact")
-      .select("id, content, verified");
+      .select("id, content, verified, type");
     resumeRows = buildResumeRows(
       (lineData ?? []) as { text: string; fact_ids: string[] }[],
       (rFactData ?? []) as CitedFact[],
@@ -118,7 +118,7 @@ export default async function JobDetailPage({
       .order("position");
     const { data: clFactData } = await supabase
       .from("fact")
-      .select("id, content, verified");
+      .select("id, content, verified, type");
     coverLetterRows = buildCoverLetterRows(
       (clLineData ?? []) as ClaimRowInput[],
       ((coverDoc.connective ?? []) as ConnectiveRowInput[]),

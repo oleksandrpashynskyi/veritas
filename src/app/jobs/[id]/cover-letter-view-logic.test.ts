@@ -69,4 +69,21 @@ describe("buildCoverLetterRows", () => {
     if (rows[0].kind !== "connective") throw new Error("expected a connective row");
     expect(rows[0].warn.length).toBeGreaterThan(0);
   });
+
+  it("does not render a cited writing_sample as evidence (dirty-row defense-in-depth)", () => {
+    // A claim's cited id resolving to a voice-only writing sample (only possible from a dirty/out-of-
+    // band row — every write path is sealed) must render as NOTHING, like an unresolved id; the claim's
+    // other valid evidence still shows.
+    const dirtyFacts: CitedFact[] = [
+      ...facts,
+      { id: "ws", content: "a paragraph of my prose", verified: true, type: "writing_sample" },
+    ];
+    const rows = buildCoverLetterRows(
+      [{ text: "Did both", fact_ids: ["f1", "ws"], position: 0 }],
+      [],
+      dirtyFacts,
+    );
+    if (rows[0].kind !== "claim") throw new Error("expected a claim row");
+    expect(rows[0].evidence.map((e) => e.id)).toEqual(["f1"]);
+  });
 });

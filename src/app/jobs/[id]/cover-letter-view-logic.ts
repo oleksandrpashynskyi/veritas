@@ -39,7 +39,12 @@ export function buildCoverLetterRows(
   connective: ConnectiveRowInput[],
   facts: CitedFact[],
 ): CoverLetterRow[] {
-  const factById = new Map(facts.map((f) => [f.id, f]));
+  // Exclude voice-only writing samples from resolution — a cited id that resolves to a writing sample
+  // (only possible from a dirty/out-of-band row; every write path is sealed) renders as NOTHING, like
+  // any unresolved id. Defense-in-depth so the display never asserts a sample as evidence.
+  const factById = new Map(
+    facts.filter((f) => f.type !== "writing_sample").map((f) => [f.id, f]),
+  );
   const rows: CoverLetterRow[] = [];
 
   for (const line of claimLines) {

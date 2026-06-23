@@ -29,7 +29,12 @@ export function buildCoverageRows(
   requirements: ViewRequirement[],
   facts: ViewFact[],
 ): CoverageRow[] {
-  const factById = new Map(facts.map((f) => [f.id, f]));
+  // Exclude voice-only writing samples from resolution — a cited id that resolves to a writing sample
+  // (only possible from a dirty/out-of-band row; every write path is sealed) renders as NOTHING, like
+  // any unresolved id. So the coverage map never shows a sample as evidence a requirement is met.
+  const factById = new Map(
+    facts.filter((f) => f.type !== "writing_sample").map((f) => [f.id, f]),
+  );
   const entryByReq = new Map(entries.map((e) => [e.requirement_id, e]));
   return requirements.map((requirement) => {
     const entry = entryByReq.get(requirement.id);

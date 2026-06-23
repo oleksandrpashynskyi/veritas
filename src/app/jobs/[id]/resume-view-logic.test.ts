@@ -32,4 +32,17 @@ describe("buildResumeRows", () => {
     const rows = buildResumeRows([{ text: "x", fact_ids: [F1, MISSING] }], facts);
     expect(rows[0].evidence.map((f) => f.id)).toEqual([F1]);
   });
+
+  it("does not render a cited writing_sample as evidence (dirty-row defense-in-depth)", () => {
+    // A cited id that resolves to a voice-only writing sample (only possible from a dirty/out-of-band
+    // row — every write path is sealed) must render as NOTHING, like an unresolved id; the line's other
+    // valid citations still show.
+    const WS = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const dirtyFacts: CitedFact[] = [
+      ...facts,
+      { id: WS, content: "A paragraph of my prose", verified: true, type: "writing_sample" },
+    ];
+    const rows = buildResumeRows([{ text: "x", fact_ids: [F1, WS] }], dirtyFacts);
+    expect(rows[0].evidence.map((f) => f.id)).toEqual([F1]);
+  });
 });
