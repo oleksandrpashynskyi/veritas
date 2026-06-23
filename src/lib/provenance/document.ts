@@ -10,10 +10,14 @@
 // re-implementation (AGENTS.md: "Touch [provenance] with reverence").
 //
 // The load-bearing facts (unchanged from M5):
-//   * The DB trigger doc_line_fact_ids_exist enforces fact EXISTENCE, not OWNERSHIP and not VERIFIED.
-//     The verified+owned set below (built via the per-user client with `.eq("verified", true)`, so RLS
-//     makes a foreign id absent and the filter makes an unverified id absent) is the real gate:
-//     reconcileResumeCitations rejects any cited id outside it.
+//   * The DB trigger doc_line_fact_ids_exist enforces fact EXISTENCE, not OWNERSHIP, not VERIFIED, and
+//     not the voice-only exclusion. The CITABLE set below (built via the per-user client with
+//     `.eq("verified", true).neq("type", "writing_sample")` — RLS makes a foreign id absent, the
+//     verified filter makes an unverified id absent, the type filter makes a writing-sample id absent)
+//     is the real gate: reconcileResumeCitations rejects any cited id outside it. Writing samples are
+//     VOICE-ONLY — they shape tone, they are NOT credentials and may never be cited as evidence by any
+//     claim line in ANY document type; excluding them HERE closes that for the résumé and the letter at
+//     one site (a latent hole on the résumé path, which predates writing samples).
 //   * A document spans TWO tables (document + its doc_lines). We insert the document first, then all
 //     CLAIM lines in one statement; if the lines fail, we compensating-delete the document (cascade
 //     clears any partial state) so nothing half-written survives.
@@ -98,21 +102,28 @@ export async function persistDocument(
     return { ok: false, error: `A ${label} already exists for this job.` };
   }
 
-  // 6. The user's REAL verified + owned fact ids, via the per-user client. RLS scopes to the owner;
-  //    `.eq("verified", true)` scopes to verified — so the set is exactly "real AND owned AND
-  //    verified", and one membership check closes realness + ownership + the verified-only rule.
-  const factRes = await client.from("fact").select("id").eq("verified", true);
+  // 6. The user's REAL CITABLE fact ids, via the per-user client. RLS scopes to the owner;
+  //    `.eq("verified", true)` scopes to verified; `.neq("type", "writing_sample")` excludes the
+  //    voice-only writing samples — so the set is exactly "real AND owned AND verified AND citable",
+  //    and one membership check closes realness + ownership + the verified-only rule + the
+  //    writing-sample exclusion, for EVERY document type at this single site.
+  const factRes = await client
+    .from("fact")
+    .select("id")
+    .eq("verified", true)
+    .neq("type", "writing_sample");
   if (factRes.error) return { ok: false, error: factRes.error.message };
-  const verifiedOwnedFactIds = new Set<string>(
+  const citableOwnedFactIds = new Set<string>(
     (factRes.data ?? []).map((r) => r.id as string),
   );
 
   // 7. Provenance reconcile — reject the WHOLE payload if any CLAIM line cites a fact that is not
-  //    owned, not verified, or not real. The DB trigger (existence-only) cannot give us this. Note:
-  //    connective prose has no citations, so it is (correctly) never reconciled.
+  //    owned, not verified, not real, or a voice-only writing sample. The DB trigger (existence-only)
+  //    cannot give us this. Note: connective prose has no citations, so it is (correctly) never
+  //    reconciled.
   const reconciled = reconcileResumeCitations({
     lines: validated.claimLines,
-    verifiedOwnedFactIds,
+    verifiedOwnedFactIds: citableOwnedFactIds,
   });
   if (!reconciled.ok) return { ok: false, error: reconciled.error };
 

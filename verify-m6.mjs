@@ -255,6 +255,10 @@ try {
   const fBu = await B.c.from("fact").insert({ type: "skill", content: MARK + "_B_FACT_U", owner: B.id, verified: false }).select("id").single();
   if (fBu.error) throw new Error(`B create-unverified-fact failed: ${fBu.error.message}`);
   const factBu = fBu.data.id;
+  // B owns a VERIFIED WRITING SAMPLE — voice-only, must NEVER be citable as evidence by a claim line.
+  const fBws = await B.c.from("fact").insert({ type: "writing_sample", content: MARK + "_B_WRITING_SAMPLE", owner: B.id, verified: true }).select("id").single();
+  if (fBws.error) throw new Error(`B create-writing-sample failed: ${fBws.error.message}`);
+  const factBws = fBws.data.id;
 
   // A's job + a seeded cover_letter document + doc_line (citing A's verified fact) — for isolation probes.
   const jA = await A.c.from("job").insert({ raw_text: MARK + "_A_JOB", company: "A Co", title: "A Role", owner: A.id }).select("id").single();
@@ -436,6 +440,13 @@ try {
   ok("[provenance] persistCoverLetter REJECTS a banned word in connective prose; nothing stored", provBannedConnOk,
     `result.ok=${provBannedConn?.ok}; err=${short(provBannedConn?.error || "")}; cover_letter docs on job=${(await coverDocs()).length}`);
 
+  // (v-c) a claim citing a VERIFIED WRITING SAMPLE -> REJECTED. Writing samples are voice-only; the
+  // shared gate's citable set excludes type=writing_sample, so they can never be cited as evidence.
+  const provWS = await persistCoverLetter(B.c, B.id, jobB2, { blocks: [claim("Did real work here", [factBws])] });
+  const provWSOk = provWS?.ok === false && (await coverDocs()).length === 0;
+  ok("[provenance] persistCoverLetter REJECTS a claim citing a VERIFIED writing_sample fact (voice-only, never citable); nothing stored", provWSOk,
+    `result.ok=${provWS?.ok}; err=${short(provWS?.error || "")}; cover_letter docs on job=${(await coverDocs()).length}`);
+
   // (vi) positive control — a connective greeting + a claim citing the user's OWN VERIFIED fact ->
   // STORED: document (with the connective on its row) + exactly one doc_line, NO doc_line ever empty.
   const provPos = await persistCoverLetter(B.c, B.id, jobB2, { blocks: [conn("greeting", "Dear Hiring Manager,"), claim(MARK + "_CL_CLAIM", [factBv])] });
@@ -485,6 +496,6 @@ else {
   for (const c of checks) { console.log(`  ${c.pass ? "PASS" : "FAIL"}  ${c.name} — ${c.detail}`); if (!c.pass) allPass = false; }
   if (!allPass) { console.log("\n✗ FAIL — an M6 app guard, a cover_letter document/doc_line RLS property, or the verified+owned provenance gate did not hold."); process.exitCode = 1; }
   else if (!cleanupClean) { console.log("\n✗ CLEANUP LEAK — checks passed but throwaway data/users remained."); process.exitCode = 3; }
-  else { console.log("\n✓ APP GUARDS HELD (no service-role import; anon key verified; Anthropic key server-only in client.ts — cover-letter generation calls runStructured) + COVER_LETTER DOCUMENT & DOC_LINE RLS RE-CONFIRMED (read isolation; update + delete no-ops BOTH directions; child-via-parent insert guard; re-parent owner-spoof; one-per-(job,type) UNIQUE -> 23505) + VERIFIED+OWNED PROVENANCE enforced FAIL-CLOSED via the REAL persistCoverLetter -> shared persistDocument (unverified + foreign + nonexistent fact rejected; empty-blocks + uncited-claim + connective-citation + banned-word[claim & connective] rejected; positive control stores claim doc_line + connective on the document with no empty doc_line; second letter rejected). Pure validators proven by vitest (cover-letter-schema.test.ts, cover-letter-view-logic.test.ts). Stack left clean."); process.exitCode = 0; }
+  else { console.log("\n✓ APP GUARDS HELD (no service-role import; anon key verified; Anthropic key server-only in client.ts — cover-letter generation calls runStructured) + COVER_LETTER DOCUMENT & DOC_LINE RLS RE-CONFIRMED (read isolation; update + delete no-ops BOTH directions; child-via-parent insert guard; re-parent owner-spoof; one-per-(job,type) UNIQUE -> 23505) + VERIFIED+OWNED PROVENANCE enforced FAIL-CLOSED via the REAL persistCoverLetter -> shared persistDocument (unverified + foreign + nonexistent fact rejected; empty-blocks + uncited-claim + connective-citation + banned-word[claim & connective] + voice-only writing-sample citation rejected; positive control stores claim doc_line + connective on the document with no empty doc_line; second letter rejected). Pure validators proven by vitest (cover-letter-schema.test.ts, cover-letter-view-logic.test.ts). Stack left clean."); process.exitCode = 0; }
 }
 setTimeout(() => process.exit(process.exitCode || 0), 3000).unref();

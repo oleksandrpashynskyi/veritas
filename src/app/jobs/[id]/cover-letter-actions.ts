@@ -98,9 +98,11 @@ export async function generateCoverLetterAction(
         "You have no verified facts to cite yet. Verify the experience/skill facts you want the letter to draw on first.",
     };
   }
-  // The reconcile set = ALL verified facts, so the preview matches what persistCoverLetter enforces at
-  // save (preview == save). The citable/voice split above only scopes what the generator may cite.
+  // Two sets: verifiedIds (ALL verified) gates the honest "every cited fact is verified" coverage
+  // check below; citableIds (verified minus writing samples = citableFacts) is what a claim may
+  // actually cite — the SAME set persistCoverLetter reconciles against at save, so preview == save.
   const verifiedIds = new Set<string>(verifiedFacts.map((f) => f.id as string));
+  const citableIds = new Set<string>(citableFacts.map((f) => f.id as string));
 
   // The tailoring signal: coverage filtered to its VERIFIED-fact-backed entries — met/partial whose
   // every cited fact is verified. A requirement met only via unverified facts is an honest gap here.
@@ -122,9 +124,11 @@ export async function generateCoverLetterAction(
     .map((c) => ({
       requirement: reqText.get(c.requirement_id) ?? "",
       status: c.status,
-      fact_ids: c.fact_ids,
+      // Strip any writing-sample id from the emphasis hint — the model is never offered a writing
+      // sample as a citable fact (writing samples still flow separately as voice, without ids).
+      fact_ids: c.fact_ids.filter((fid) => citableIds.has(fid)),
     }))
-    .filter((c) => c.requirement.length > 0);
+    .filter((c) => c.requirement.length > 0 && c.fact_ids.length > 0);
   if (backed.length === 0) {
     return {
       status: "blocked",
@@ -155,7 +159,7 @@ export async function generateCoverLetterAction(
   // EXACTLY what Save will store, never a claim citing a hallucinated/unverified id. Fail closed.
   const reconciled = reconcileResumeCitations({
     lines: result.claimLines,
-    verifiedOwnedFactIds: verifiedIds,
+    verifiedOwnedFactIds: citableIds,
   });
   if (!reconciled.ok) {
     return {

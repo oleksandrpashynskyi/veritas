@@ -259,6 +259,10 @@ try {
   const fBu = await B.c.from("fact").insert({ type: "skill", content: MARK + "_B_FACT_U", owner: B.id, verified: false }).select("id").single();
   if (fBu.error) throw new Error(`B create-unverified-fact failed: ${fBu.error.message}`);
   const factBu = fBu.data.id;
+  // B owns a VERIFIED WRITING SAMPLE — voice-only, must NEVER be citable as evidence by a résumé line.
+  const fBws = await B.c.from("fact").insert({ type: "writing_sample", content: MARK + "_B_WRITING_SAMPLE", owner: B.id, verified: true }).select("id").single();
+  if (fBws.error) throw new Error(`B create-writing-sample failed: ${fBws.error.message}`);
+  const factBws = fBws.data.id;
 
   // A's job + a seeded résumé document + doc_line (citing A's verified fact) — for isolation probes.
   const jA = await A.c.from("job").insert({ raw_text: MARK + "_A_JOB", company: "A Co", title: "A Role", owner: A.id }).select("id").single();
@@ -443,6 +447,14 @@ try {
   ok("[provenance] persistResume REJECTS a line containing a banned word; nothing stored", provBannedOk,
     `result.ok=${provBanned?.ok}; err=${short(provBanned?.error || "")}; résumé docs on job=${(await resumeDocs()).length}`);
 
+  // (v-b) cite a VERIFIED WRITING SAMPLE -> REJECTED. The shared gate's citable set excludes
+  // type=writing_sample, so a voice-only sample can never be cited as evidence — closing the latent
+  // résumé hole (writing samples predate the résumé path; M6 shared-gate fix).
+  const provWS = await persistResume(B.c, B.id, jobB2, { lines: [{ text: "Did real work here", fact_ids: [factBws] }] });
+  const provWSOk = provWS?.ok === false && (await resumeDocs()).length === 0;
+  ok("[provenance] persistResume REJECTS a line citing a VERIFIED writing_sample fact (voice-only, never citable); nothing stored", provWSOk,
+    `result.ok=${provWS?.ok}; err=${short(provWS?.error || "")}; résumé docs on job=${(await resumeDocs()).length}`);
+
   // (vi) positive control — cite the user's OWN VERIFIED fact -> STORED (document + doc_line).
   const provPos = await persistResume(B.c, B.id, jobB2, { lines: [{ text: MARK + "_RESUME_LINE", fact_ids: [factBv] }] });
   const posDocs = await resumeDocs();
@@ -489,7 +501,7 @@ else {
   for (const c of checks) { console.log(`  ${c.pass ? "PASS" : "FAIL"}  ${c.name} — ${c.detail}`); if (!c.pass) allPass = false; }
   if (!allPass) { console.log("\n✗ FAIL — an M5 app guard, a document/doc_line RLS property, or the verified+owned provenance gate did not hold."); process.exitCode = 1; }
   else if (!cleanupClean) { console.log("\n✗ CLEANUP LEAK — checks passed but throwaway data/users remained."); process.exitCode = 3; }
-  else { console.log("\n✓ APP GUARDS HELD (no service-role import; anon key verified; Anthropic key server-only in client.ts) + DOCUMENT & DOC_LINE RLS RE-CONFIRMED (read isolation; update + delete no-ops BOTH directions; child-via-parent insert guard; re-parent owner-spoof; one-document-per-(job,type) UNIQUE -> 23505) + VERIFIED+OWNED PROVENANCE enforced FAIL-CLOSED via the REAL persistResume (unverified + foreign + nonexistent fact rejected, empty-lines + uncited-line + banned-word rejected, own-verified-fact stored, second résumé rejected). Pure validator proven by vitest (resume-schema.test.ts). Stack left clean."); process.exitCode = 0; }
+  else { console.log("\n✓ APP GUARDS HELD (no service-role import; anon key verified; Anthropic key server-only in client.ts) + DOCUMENT & DOC_LINE RLS RE-CONFIRMED (read isolation; update + delete no-ops BOTH directions; child-via-parent insert guard; re-parent owner-spoof; one-document-per-(job,type) UNIQUE -> 23505) + VERIFIED+OWNED PROVENANCE enforced FAIL-CLOSED via the REAL persistResume (unverified + foreign + nonexistent fact rejected, empty-lines + uncited-line + banned-word + voice-only writing-sample citation rejected, own-verified-fact stored, second résumé rejected). Pure validator proven by vitest (resume-schema.test.ts). Stack left clean."); process.exitCode = 0; }
 }
 // allow the event loop to drain (supabase-js keep-alive sockets) then exit cleanly
 setTimeout(() => process.exit(process.exitCode || 0), 3000).unref();

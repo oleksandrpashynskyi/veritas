@@ -76,13 +76,21 @@ export async function generateResumeAction(
     .order("created_at", { ascending: false });
   if (factRes.error) return { status: "error", error: factRes.error.message };
   const verifiedFacts = factRes.data ?? [];
-  if (verifiedFacts.length === 0) {
+  // Writing samples are VOICE-ONLY and may never be cited as evidence by a résumé line — the citable
+  // pool excludes them (the shared gate enforces the same exclusion at save, so preview == save).
+  const citableFacts = verifiedFacts.filter((f) => f.type !== "writing_sample");
+  if (citableFacts.length === 0) {
     return {
       status: "blocked",
-      reason: "You have no verified facts yet. Verify the facts you want on your résumé first.",
+      reason:
+        "You have no verified facts to put on your résumé yet. Verify the experience/skill facts you want first (writing samples shape voice only and can't be cited).",
     };
   }
+  // Two sets: verifiedIds (ALL verified) gates the honest "every cited fact is verified" coverage check
+  // below; citableIds (verified minus writing samples) is what a line may actually cite — the SAME set
+  // the gate reconciles against, so preview == save.
   const verifiedIds = new Set<string>(verifiedFacts.map((f) => f.id as string));
+  const citableIds = new Set<string>(citableFacts.map((f) => f.id as string));
 
   // The tailoring signal: coverage filtered to its VERIFIED-fact-backed entries — met/partial whose
   // every cited fact is verified. A requirement met only via unverified facts is an honest gap here.
@@ -104,9 +112,11 @@ export async function generateResumeAction(
     .map((c) => ({
       requirement: reqText.get(c.requirement_id) ?? "",
       status: c.status,
-      fact_ids: c.fact_ids,
+      // Strip any writing-sample id from the emphasis hint — the model is never offered a writing
+      // sample as a citable fact.
+      fact_ids: c.fact_ids.filter((fid) => citableIds.has(fid)),
     }))
-    .filter((c) => c.requirement.length > 0);
+    .filter((c) => c.requirement.length > 0 && c.fact_ids.length > 0);
   if (backed.length === 0) {
     return {
       status: "blocked",
@@ -118,7 +128,7 @@ export async function generateResumeAction(
   // ONE billed Sonnet call. Inputs are personal data; generateResume never logs them and fail-closes
   // (refusal / non-JSON / banned word / off-shape) to a closed result.
   const result = await generateResume(
-    verifiedFacts.map((f) => ({
+    citableFacts.map((f) => ({
       id: f.id as string,
       type: f.type as string,
       content: f.content as string,
@@ -136,7 +146,7 @@ export async function generateResumeAction(
   // what Save will store, never a line citing a hallucinated/unverified id. Fail closed -> regenerate.
   const reconciled = reconcileResumeCitations({
     lines: result.value.lines,
-    verifiedOwnedFactIds: verifiedIds,
+    verifiedOwnedFactIds: citableIds,
   });
   if (!reconciled.ok) {
     return {
@@ -151,8 +161,9 @@ export async function generateResumeAction(
     };
   }
 
-  // Carry the cited facts (content + verified) so the preview can render evidence by id — preview==save.
-  const facts: CitedFact[] = verifiedFacts.map((f) => ({
+  // Carry the citable facts (content + verified) so the preview can render evidence by id — a line
+  // cites only citable facts, so this is the full evidence pool. preview == save.
+  const facts: CitedFact[] = citableFacts.map((f) => ({
     id: f.id as string,
     content: f.content as string,
     verified: f.verified as boolean,
