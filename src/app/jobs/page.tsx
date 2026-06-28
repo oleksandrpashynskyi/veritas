@@ -36,6 +36,9 @@ export default async function JobsPage({
             Profile
           </Link>
           <span className="font-medium">Jobs</span>
+          <Link href="/profile" className="text-zinc-600 underline">
+            Identity
+          </Link>
         </nav>
         <div className="flex items-center gap-3">
           <span className="text-sm text-zinc-600">{user.email}</span>

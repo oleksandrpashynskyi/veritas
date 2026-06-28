@@ -10,7 +10,11 @@
 //   C) Per-user OWNERSHIP isolation for the `authenticated` role (Auth Foundation /
 //      M1.5), run in BOTH directions (A-attacks-B AND B-attacks-A) for EVERY table and
 //      EVERY operation — so an asymmetric policy bug (e.g. a leaked/hardcoded uid that
-//      lets B reach A but not A reach B) cannot stay green. Per direction per table:
+//      lets B reach A but not A reach B) cannot stay green. The six FK-owned tables run the full 8-op
+//      battery; `profile` (candidate identity — author metadata for the PDF letterhead, NOT a fact;
+//      PK = user_id, one row per user, select/insert/update policies only) runs a tailored 6-op battery
+//      (read-iso, ins-as-other, ins-own, give-away, upd-other, upd-own) — del-* omitted (no delete
+//      policy). Per direction per table:
 //        • READ — attacker sees its OWN rows and SPECIFICALLY NOT the victim's seeded
 //          rows (by exact id); an empty/partial read is CNV, never a denial.
 //        • WRITE — INSERT-as-victim and give-away (re-own/re-parent to the victim) are a
@@ -182,10 +186,13 @@ function isLoopbackUrl(url) {
 }
 
 // ── result tracking ───────────────────────────────────────────────────────────────
-// 24 anon (read/insert/update/delete × 6) + 96 cross-user isolation (6 tables × 8 ops ×
-// 2 directions) + 1 build guard = 121.
+// 24 anon (read/insert/update/delete × 6) + 96 cross-user isolation (6 FK-owned tables × 8 ops ×
+// 2 directions) + 12 profile isolation (1 table × 6 ops × 2 directions) + 1 build guard = 133.
+// Profile runs a tailored 6-op battery (read-iso, ins-as-other, ins-own, give-away, upd-other, upd-own)
+// rather than 8: its policy set is select/insert/update only (no delete by design — a profile is edited
+// in place and cascades when its auth user is deleted), so del-other/del-own are intentionally absent.
 const checks = [];
-const EXPECTED = 121;
+const EXPECTED = 133;
 function record(name, verdict, detail) {
   checks.push({ name, verdict, detail });
 }
@@ -359,6 +366,7 @@ async function sweep(svc) {
   };
   await del("job", "raw_text");
   await del("fact", "content");
+  await del("profile", "full_name"); // independent (FK to auth.users only) — order does not matter
   return errors;
 }
 
@@ -385,6 +393,7 @@ async function confirmClean(svc, errors) {
   };
   const leftJobs = await count("job", "raw_text");
   const leftFacts = await count("fact", "content");
+  const leftProfiles = await count("profile", "full_name");
   let usersPresent = "unknown";
   try {
     const { data, error } = await svc.auth.admin.listUsers({ page: 1, perPage: 1000 });
@@ -399,8 +408,8 @@ async function confirmClean(svc, errors) {
       usersPresent = (data?.users || []).filter((u) => emails.has(u.email)).length;
     }
   } catch (e) { errors.push(`confirmClean listUsers threw: ${(e.message || "").split("\n")[0]}`); usersPresent = "unconfirmed(threw)"; }
-  const clean = errors.length === 0 && leftJobs === 0 && leftFacts === 0 && usersPresent === 0;
-  return { clean, errors, leftJobs, leftFacts, usersPresent };
+  const clean = errors.length === 0 && leftJobs === 0 && leftFacts === 0 && leftProfiles === 0 && usersPresent === 0;
+  return { clean, errors, leftJobs, leftFacts, leftProfiles, usersPresent };
 }
 
 async function createTestUser(svc, email) {
@@ -815,7 +824,47 @@ async function coverageBattery(svc, tag, atk, atkId, vic, vicId) {
     recordPositiveDelete(L("del-own"), b, a, res, "coverage"); }
 }
 
-// ── Part C: per-user ownership isolation, BOTH directions, all six tables ────────────
+// PROFILE: candidate identity — author metadata for the PDF letterhead/signature, NOT a fact (never
+// cited/matched/generated). PK = user_id (a FK to auth.users), so user_id is BOTH the row identity AND
+// the ownership column the policies key on — one row per user. Policies are select/insert/update only
+// (no delete by design), so this 6-op battery proves the FULL governed surface in both directions: read
+// isolation + INSERT (as-other denied 42501 / own allowed) + give-away (re-keying user_id to the victim
+// denied 42501) + UPDATE (other → silent no-op / own allowed). del-* is intentionally ABSENT (no delete
+// policy). ORDERING MATTERS: ins-as-other + give-away run while the victim has NO profile, so the ONLY
+// thing that can deny them is AUTHORIZATION (42501) — never a PK collision (23505); the victim's profile
+// is svc-seeded only afterwards, for read-iso + upd-other. A fresh-slate delete makes each direction
+// independent (the other direction, or a prior run, may have left rows). give-away is tracked by the
+// stable full_name marker, because the PK (user_id) is exactly what that attack would change.
+async function profileBattery(svc, tag, atk, atkId, vic, vicId) {
+  const L = (op) => `profile ${tag} ${op}`;
+  const pCnt = (uid) => gtCntEq(svc, "profile", "user_id", uid);
+  const pName = (uid) => gtColBy(svc, "profile", "user_id", uid, "full_name");
+  const ownMark = MARK + `_${tag}_profile_own`;
+  await svc.from("profile").delete().in("user_id", [atkId, vicId]);
+
+  { const b = await pCnt(vicId);
+    const res = await atk.from("profile").insert({ user_id: vicId, full_name: MARK + `_${tag}_profile_insVic` }).select("user_id"); const a = await pCnt(vicId);
+    recordHardDeny(L("ins-as-other"), b, a, res, "42501", "a profile owned by the victim"); }
+  { const b = await pCnt(atkId);
+    const res = await atk.from("profile").insert({ user_id: atkId, full_name: ownMark }).select("user_id"); const a = await pCnt(atkId);
+    recordPositiveAppear(L("ins-own"), b, a, res, "its own profile"); }
+  { const b = await gtColBy(svc, "profile", "full_name", ownMark, "user_id");
+    const res = await atk.from("profile").update({ user_id: vicId }).eq("user_id", atkId).select("user_id"); const a = await gtColBy(svc, "profile", "full_name", ownMark, "user_id");
+    recordHardDeny(L("give-away"), b, a, res, "42501", "profile.user_id"); }
+
+  // Seed the victim's profile (svc) so read-iso + upd-other have a victim row to protect.
+  await insSvc(svc, "profile", { user_id: vicId, full_name: MARK + `_${tag}_profile_vic` }, "user_id");
+
+  await checkReadIso(atk, "profile", L("read-iso"), [atkId], [vicId], "user_id");
+  { const b = await pName(vicId);
+    const res = await atk.from("profile").update({ full_name: MARK + `_${tag}_profile_hack` }).eq("user_id", vicId).select("user_id"); const a = await pName(vicId);
+    recordNoopUpdate(L("upd-other"), b, a, res, "victim's profile.full_name"); }
+  { const want = JSON.stringify(MARK + `_${tag}_profile_mine`);
+    const res = await atk.from("profile").update({ full_name: MARK + `_${tag}_profile_mine` }).eq("user_id", atkId).select("user_id"); const a = await pName(atkId);
+    recordPositiveChange(L("upd-own"), a, want, res, "profile.full_name"); }
+}
+
+// ── Part C: per-user ownership isolation, BOTH directions, all six FK-owned tables + profile ─────────
 async function partC(ctx) {
   const { svc, userA, idA, userB, idB } = ctx;
   const factCfg = { mkRow: (o, m) => ({ type: "skill", content: m, owner: o }), mutCol: "role", markerCol: "content" };
@@ -829,6 +878,7 @@ async function partC(ctx) {
     await documentBattery(svc, tag, atk, atkId, vic, vicId);
     await docLineBattery(svc, tag, atk, atkId, vic, vicId);
     await coverageBattery(svc, tag, atk, atkId, vic, vicId);
+    await profileBattery(svc, tag, atk, atkId, vic, vicId);
   }
 }
 
@@ -847,7 +897,7 @@ function partB() {
   // The whole body is guarded: a filesystem/build fault (e.g. a Windows .next lock that survives the
   // rmSync retries in buildOnce) must NOT throw out of here — partB runs OUTSIDE the main try/catch,
   // so an escaping throw would crash before the tally + cleanup reporting. Exactly one "build guard"
-  // check is recorded on every path (it is 1 of the EXPECTED 121), so the tally guard stays intact.
+  // check is recorded on every path (it is 1 of the EXPECTED 133), so the tally guard stays intact.
   try {
     if (existsSync(PROBE_DIR)) cleanupProbeSync();
     const base = buildOnce();
@@ -923,7 +973,7 @@ function gracefulExit(code) {
   if (cleanupStatus) {
     console.log(cleanupStatus.clean
       ? "  cleanup: stack left clean (marker rows swept, A/B test users deleted, verified)."
-      : `  CLEANUP LEAK — left jobs=${cleanupStatus.leftJobs}, facts=${cleanupStatus.leftFacts}, A/B users present=${cleanupStatus.usersPresent}${cleanupStatus.errors.length ? "; errors: " + cleanupStatus.errors.join(" | ") : ""}`);
+      : `  CLEANUP LEAK — left jobs=${cleanupStatus.leftJobs}, facts=${cleanupStatus.leftFacts}, profiles=${cleanupStatus.leftProfiles}, A/B users present=${cleanupStatus.usersPresent}${cleanupStatus.errors.length ? "; errors: " + cleanupStatus.errors.join(" | ") : ""}`);
     console.log("");
   }
 
@@ -944,7 +994,7 @@ function gracefulExit(code) {
     console.log("✗ CLEANUP LEAK — every registered check passed, but the proof did not leave the stack clean (see above). NOT a pass.");
     exitCode = 3;
   } else {
-    console.log("✓ SECURITY PROVED — anon denied every read/insert/update/delete on all six tables; authenticated users A and B are isolated on all six tables in BOTH directions (read + write — cross-owner INSERT/give-away → 42501, cross-user UPDATE/DELETE → silent zero-row no-op — by service-role ground truth, with positive controls); the server-only client-import build guard holds attributably.");
+    console.log("✓ SECURITY PROVED — anon denied every read/insert/update/delete on all six FK-owned tables; authenticated users A and B are isolated in BOTH directions on those six tables (full 8-op battery) AND on the profile identity table (tailored 6-op battery — read-iso + INSERT/give-away → 42501, cross-user UPDATE → silent zero-row no-op, with positive controls; no delete policy by design) — all by service-role ground truth; the server-only client-import build guard holds attributably.");
     exitCode = 0;
   }
   gracefulExit(exitCode);

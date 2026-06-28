@@ -1,6 +1,6 @@
 ---
 name: veritas-security-proof
-description: Prove, by execution against a LOCAL Supabase stack — which it first resets to the working-tree migrations (so the proof binds to the files about to merge, not a stale connected schema) and then connects to via supabase status — three security properties — (A) RLS deny-by-default blocks the public anon role from READING any row (an unfiltered select returns 0 while the service role sees the rows) and from WRITING (insert/update/delete on a representative seeded row of each table, judged solely by service-role ground truth) on all six tables; (C) per-user ownership isolation for the authenticated role — two real users A and B cannot read or write each other's rows (read by specific-id presence/absence; cross-user writes judged by service-role ground truth, with positive controls), the Auth Foundation milestone (M1.5); and (B) the server-only guard makes `next build` fail ATTRIBUTABLY when the db client (@/lib/db/client) is imported directly from a Client Component. The proof creates and deletes auth users, so it runs only against a loopback (local) URL. Run before any CRUD touches real career data, and on any change to src/lib/db, the RLS in supabase/migrations, or this script.
+description: Prove, by execution against a LOCAL Supabase stack — which it first resets to the working-tree migrations (so the proof binds to the files about to merge, not a stale connected schema) and then connects to via supabase status — three security properties — (A) RLS deny-by-default blocks the public anon role from READING any row (an unfiltered select returns 0 while the service role sees the rows) and from WRITING (insert/update/delete on a representative seeded row of each table, judged solely by service-role ground truth) on all six tables; (C) per-user ownership isolation for the authenticated role — two real users A and B cannot read or write each other's rows (read by specific-id presence/absence; cross-user writes judged by service-role ground truth, with positive controls) across the six FK-owned tables and the profile identity table, the Auth Foundation milestone (M1.5); and (B) the server-only guard makes `next build` fail ATTRIBUTABLY when the db client (@/lib/db/client) is imported directly from a Client Component. The proof creates and deletes auth users, so it runs only against a loopback (local) URL. Run before any CRUD touches real career data, and on any change to src/lib/db, the RLS in supabase/migrations, or this script.
 disable-model-invocation: true
 argument-hint: "(no arguments; loopback/local stack only; runs db reset + sources creds from supabase status; creates/deletes test users; runs next build)"
 ---
@@ -38,11 +38,15 @@ puts real career data in the database:
     RLS no-op** (0 rows, no error) that leaves that row unchanged/present. **Positive
     controls** (the owner acting on its OWN rows succeeds) run alongside every deny check,
     so a blanket failure cannot masquerade as isolation.
-  All six tables get this treatment in both directions — proven directly, not inferred from one another: the
+  All six FK-owned tables get this treatment in both directions — proven directly, not inferred from one another: the
   owned roots `fact`/`job`, the one-hop children `requirement`/`coverage`/`document` (owner
   inherited via `job`), and the two-hop `doc_line` (via `document → job`). For a child,
   "give-away" means re-parenting it to a job owned by the other user, which the UPDATE
-  `WITH CHECK` rejects with `42501`.
+  `WITH CHECK` rejects with `42501`. The **`profile`** identity table (candidate name + contact for the
+  PDF letterhead — author metadata, NOT a fact; PK = `user_id`, one row per user) is also covered in both
+  directions, with a tailored **6-op** battery (read-iso, ins-as-other, ins-own, give-away, upd-other,
+  upd-own): its policy set is select/insert/update only, so `del-*` is omitted (no delete policy by
+  design), and "give-away" is re-keying `user_id` to the other user, rejected `42501` by `WITH CHECK`.
 - **B. The `server-only` build guard.** A Client Component importing the db client
   **directly** (`@/lib/db/client`, which carries the service-role key) makes `next build`
   **fail attributably** — the app builds green *without* the probe and fails *only with*
@@ -75,10 +79,10 @@ transport/connection failure, a 404, a service-role
 check that can't confirm the seeded rows or the post-write DB state, an anon write that
 never reached RLS (auth/gateway/transport), a positive control that fails (the owner
 couldn't touch its own row), a build that can't run / a non-green baseline / a failure
-not attributable to our probe, or fewer than the **121** registered checks executing. An
-empty or partial result is a FAILURE, never a pass. And even when all 121 pass, if the
+not attributable to our probe, or fewer than the **133** registered checks executing. An
+empty or partial result is a FAILURE, never a pass. And even when all 133 pass, if the
 teardown can't be confirmed clean (sweep/delete errored, or marker rows / A-B users remain)
-the run exits **3 (cleanup leak)**, not 0. Report success only when all 121 checks ran and
+the run exits **3 (cleanup leak)**, not 0. Report success only when all 133 checks ran and
 passed **and** the stack was left clean. The bundled script enforces this; do not work around it.
 
 ## What it checks
@@ -88,8 +92,8 @@ passed **and** the stack was left clean. The bundled script enforces this; do no
 | A — insert denial (×6) | anon INSERT a row, then svc re-count | svc ground truth: **no new row** — and the write reached Postgres |
 | A — update denial (×6) | anon UPDATE a seeded row, then svc re-read | svc ground truth: the column is **unchanged** |
 | A — delete denial (×6) | anon DELETE a seeded row, then svc re-check | svc ground truth: the row is **still present** |
-| C — read isolation (×12) | each user, **both directions**, all six tables: UNFILTERED select; assert own ids present, other's ids absent | sees all own seeded rows, **none** of the victim's specific rows |
-| C — write isolation (×84) | **both directions**, all six tables: attacker INSERT-as-victim / give-away (re-own a root or re-parent a child to the victim) / UPDATE/DELETE the victim's row, plus owner-on-own positive controls | cross-owner INSERT & give-away → `42501` + DB unchanged; cross-user UPDATE/DELETE → **zero-row SUCCESS** (an error is CNV) + victim's row unchanged/present; the owner's own ops **succeed** |
+| C — read isolation (×14) | each user, **both directions**, all six FK-owned tables + `profile`: UNFILTERED select; assert own ids present, other's ids absent | sees all own seeded rows, **none** of the victim's specific rows |
+| C — write isolation (×94) | **both directions**, all six FK-owned tables (7 write ops) + `profile` (5 write ops — no delete policy): attacker INSERT-as-victim / give-away (re-own a root, re-parent a child, or re-key a profile's `user_id` to the victim) / UPDATE/DELETE the victim's row, plus owner-on-own positive controls | cross-owner INSERT & give-away → `42501` + DB unchanged; cross-user UPDATE/DELETE → **zero-row SUCCESS** (an error is CNV) + victim's row unchanged/present; the owner's own ops **succeed** |
 | B — build guard (×1) | baseline `next build`, then again with a probe importing `@/lib/db/client` | baseline **green**; probe build **fails** naming `security-probe` → `client.ts` + the server-only boundary |
 
 A returned row, a new row after an anon INSERT, a column the anon UPDATE changed, a row
@@ -124,11 +128,12 @@ node .claude/skills/veritas-security-proof/verify-security.mjs "$PWD"
 It **resets the local DB** to the working-tree migrations (≈30–60s), refuses unless the
 reset target is loopback, creates two test users (A, B) via the Admin API, seeds
 owner-stamped probe rows via the service role, runs the **24 anon** checks
-(read/insert/update/delete × 6) and the **96 authenticated-isolation** checks (users A vs
-B, **both directions**, read + write, all six tables — each battery self-seeds), then builds
+(read/insert/update/delete × 6) and the **108 authenticated-isolation** checks (users A vs
+B, **both directions**, read + write, all six FK-owned tables + the `profile` identity table — each
+battery self-seeds), then builds
 once **without** a probe (must be green) and once **with** a temporary
 `src/app/security-probe/page.tsx` (must fail attributably), removing the probe and deleting
-the test users after. Exit `0` = proved (all 121 checks) and the stack left clean, `1` =
+the test users after. Exit `0` = proved (all 133 checks) and the stack left clean, `1` =
 regression (a leak or a broken guard — STOP, do not merge), `2` = could not verify (fix the
 cause and re-run; never treat as a pass), `3` = cleanup leak (every check passed but probe
 rows / A-B users were left behind — distinct from the security result).
