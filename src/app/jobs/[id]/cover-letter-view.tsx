@@ -55,7 +55,17 @@ export function CoverLetterView({
           {claimCount} cited {claimCount === 1 ? "claim" : "claims"} woven with framing — every claim
           sourced from a verified fact.
         </p>
-        <CoverLetterDeleteButton jobId={jobId} />
+        <div className="flex items-center gap-2">
+          {/* On-demand PDF of exactly this approved letter (same shared resolution as this view). */}
+          <a
+            href={`/jobs/${jobId}/export/cover-letter`}
+            download
+            className="rounded border border-zinc-300 px-3 py-1 text-sm text-zinc-700 hover:bg-zinc-50"
+          >
+            Download PDF
+          </a>
+          <CoverLetterDeleteButton jobId={jobId} />
+        </div>
       </div>
       <div className="flex flex-col gap-3 rounded border border-zinc-200 px-4 py-3">
         {rows.map((row, i) => (

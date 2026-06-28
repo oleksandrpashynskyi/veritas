@@ -54,6 +54,9 @@ export default async function FactsPage({
           <Link href="/jobs" className="text-zinc-600 underline">
             Jobs
           </Link>
+          <Link href="/profile" className="text-zinc-600 underline">
+            Identity
+          </Link>
         </nav>
         <div className="flex items-center gap-3">
           <span className="text-sm text-zinc-600">{user.email}</span>

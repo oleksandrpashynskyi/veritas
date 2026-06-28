@@ -51,7 +51,17 @@ export function ResumeView({ jobId, rows }: { jobId: string; rows: ResumeLineVie
         <p className="text-sm text-zinc-500">
           {rows.length} approved {rows.length === 1 ? "line" : "lines"} — every one sourced from a verified fact.
         </p>
-        <ResumeDeleteButton jobId={jobId} />
+        <div className="flex items-center gap-2">
+          {/* On-demand PDF of exactly these approved lines (same shared resolution as this view). */}
+          <a
+            href={`/jobs/${jobId}/export/resume`}
+            download
+            className="rounded border border-zinc-300 px-3 py-1 text-sm text-zinc-700 hover:bg-zinc-50"
+          >
+            Download PDF
+          </a>
+          <ResumeDeleteButton jobId={jobId} />
+        </div>
       </div>
       <ul className="flex flex-col gap-2">
         {rows.map((row, i) => (
